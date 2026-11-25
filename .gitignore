@@ -1,0 +1,47 @@
+# ===== 敏感配置 =====
+core/config.json
+~/.domainintel.json
+
+# ===== 输出与缓存 =====
+output/
+!output/.gitkeep
+*.log
+
+# ===== 样本（绝对不能提交） =====
+*.exe
+*.dll
+*.zip
+*.rar
+*.7z
+*.msi
+*.apk
+*.dmg
+*.pkg
+samples/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# ===== 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini

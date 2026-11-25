@@ -1,0 +1,722 @@
+# -*- coding: utf-8 -*-
+"""
+HTTP / TLS / 页面指纹 采集模块
+包含 FOFA / Quake / ZoomEye 可用的指纹：
+- favicon hash（mmh3，FOFA 的 icon_hash 语法）
+- 页面 body MD5
+- 标题、Server、特征词、下载链接、对象存储桶
+- TLS 证书明细与 SHA256
+"""
+import re
+import ssl
+import socket
+import hashlib
+import base64
+from urllib.parse import urljoin
+
+import requests
+import urllib3
+
+urllib3.disable_warnings()
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+UA_POOL = [
+    UA,
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
+     "Gecko/20100101 Firefox/121.0"),
+    ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+]
+
+# 可执行 / 压缩包扩展名（不含 html、php 等页面）
+BINARY_EXT = r"(?:exe|zip|rar|7z|msi|apk|dmg|pkg|tar|gz|cab)"
+
+# 高风险 TLD（注册便宜、滥用率高）
+RISKY_TLDS = ("cyou", "top", "xyz", "icu", "buzz", "click", "shop", "vip",
+              "work", "loan", "men", "gq", "tk", "ml", "cf", "ga", "rest",
+              "monster", "sbs", "cfd", "buzz")
+
+
+def _looks_random(label):
+    """
+    判断域名主体是否像随机串。
+    思路：真实品牌/单词通常能被拆成常见音节或本身就是词典词；
+    随机串往往长度长、缺乏常见双字母组合、字母分布发散。
+    """
+    s = label.lower()
+    if len(s) < 8:
+        return False
+
+    # 明显的品牌词/常见词直接排除
+    COMMON = ("todesk", "deepseek", "typora", "nexus", "mod", "google", "apple",
+              "microsoft", "windows", "android", "office", "adobe", "chrome",
+              "browser", "player", "music", "video", "photo", "cloud", "drive",
+              "store", "market", "update", "install", "setup", "download",
+              "client", "server", "console", "manager", "helper", "tool")
+    for w in COMMON:
+        if w in s:
+            return False
+
+    vowels = sum(1 for ch in s if ch in "aeiou")
+    vr = vowels / max(1, len(s))
+
+    # 常见英文双字母组合出现次数
+    bigrams = ("th", "he", "in", "er", "an", "re", "on", "at", "en", "nd",
+               "ti", "es", "or", "te", "of", "ed", "is", "it", "al", "ar",
+               "st", "to", "nt", "ng", "se", "ha", "as", "ou", "io", "le",
+               "ve", "co", "me", "de", "hi", "ri", "ro", "ic", "ne", "ea",
+               "ra", "ce", "li", "ch", "ll", "be", "ma", "si", "om", "ur")
+    bg = sum(1 for i in range(len(s) - 1) if s[i:i+2] in bigrams)
+
+    # 连续辅音
+    max_cons = cur = 0
+    for ch in s:
+        if ch.isalpha() and ch not in "aeiou":
+            cur += 1
+            max_cons = max(max_cons, cur)
+        else:
+            cur = 0
+
+    # 判定：长串 + 常见组合极少 + 辅音堆积
+    if len(s) >= 12 and bg <= 2:
+        return True
+    if max_cons >= 4 and bg <= 3:
+        return True
+    if len(s) >= 14 and vr < 0.25:
+        return True
+    return False
+
+
+def _risky_domain(host):
+    """判断是否高风险域名：高风险 TLD + 随机串主体"""
+    h = (host or "").lower().split(":")[0]
+    parts = h.split(".")
+    if len(parts) < 2:
+        return False
+    tld = parts[-1]
+    if tld not in RISKY_TLDS:
+        return False
+    label = parts[-2] if len(parts) >= 2 else ""
+    return _looks_random(label)
+
+
+# 主流网盘（黑产常用来托管恶意样本，绕过域名封禁）
+NETDISK_PATTERNS = [
+    (r"pan\.baidu\.com/s/", "百度网盘"),
+    (r"drive\.uc\.cn/s/", "UC网盘"),
+    (r"pan\.quark\.cn/s/", "夸克网盘"),
+    (r"pan\.xunlei\.com/s/", "迅雷网盘"),
+    (r"aliyundrive\.com/s/", "阿里云盘"),
+    (r"www\.aliyundrive\.com/s/", "阿里云盘"),
+    (r"cloud\.189\.cn/t/", "天翼云盘"),
+    (r"caiyun\.139\.com/", "移动云盘"),
+    (r"115\.com/s/", "115网盘"),
+    (r"lanzou[a-z]?\.com/", "蓝奏云"),
+    (r"123pan\.com/s/", "123云盘"),
+    (r"pan\.jianguoyun\.com", "坚果云"),
+]
+
+# 跳转网关特征（域名里带这些 + go.php / jump / tj）
+PUBLIC_PLATFORM_HOSTS = {
+    "github.com", "www.github.com", "gitlab.com", "gitee.com",
+    "opensource.org", "www.opensource.org",
+    "w3.org", "www.w3.org", "schema.org",
+    "google.com", "www.google.com", "fonts.googleapis.com",
+    "fonts.gstatic.com", "cdnjs.cloudflare.com",
+    "cloudflare.com", "beian.miit.gov.cn", "beian.mps.gov.cn",
+    "miit.gov.cn", "tsm.miit.gov.cn",
+}
+
+GATEWAY_HINTS = ["hhxiazai", "tj.", "jump", "go.php", "down.php", "dl.php",
+                 "xiazai", "soft", "down1", "down2"]
+
+FEATURE_WORDS = [
+    "deepseek", "深度求索", "官网", "下载", "客户端", "免费", "破解", "客服",
+    "vpn", "梯子", "翻墙", "加速器", "科学上网",
+    "apk", "android", "windows", "mac", "ios", "dmg", "exe",
+    "二维码", "扫码", "邀请", "充值", "会员", "vip",
+    "登录", "注册", "官方", "正版", "备案",
+]
+
+
+def _favicon_hash(content):
+    """FOFA icon_hash 算法：内容 base64 后取 mmh3"""
+    try:
+        import mmh3
+        return mmh3.hash(base64.encodebytes(content))
+    except Exception:
+        return None
+
+
+def _extract_favicon(txt, url, timeout=6):
+    """从 HTML 里找 favicon 并计算 hash"""
+    m = re.search(r'<link[^>]+rel=["\'](?:shortcut )?icon["\'][^>]*href=["\']([^"\']+)', txt, re.I)
+    if not m:
+        m = re.search(r'<link[^>]+href=["\']([^"\']+)["\'][^>]*rel=["\'](?:shortcut )?icon["\']',
+                      txt, re.I)
+    if not m:
+        return {}
+    fav = m.group(1).strip()
+    if fav.startswith("//"):
+        fav = "https:" + fav
+    elif not fav.startswith("http"):
+        fav = urljoin(url, fav)
+    try:
+        fr = requests.get(fav, headers={"User-Agent": UA}, timeout=timeout, verify=False)
+        if fr.status_code == 200 and fr.content:
+            return {"favicon_url": fav,
+                    "favicon_hash": _favicon_hash(fr.content),
+                    "favicon_md5": hashlib.md5(fr.content).hexdigest()}
+    except Exception:
+        pass
+    return {}
+
+
+def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
+    """探测单个 URL。maxbytes 给足——克隆站常把 <title> 埋在内联脚本之后。"""
+    info = {"url": url}
+    try:
+        hdrs = {"User-Agent": ua or UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
+        if referer:
+            hdrs["Referer"] = referer
+        r = requests.get(url, headers=hdrs, timeout=timeout,
+                         allow_redirects=True, verify=False, stream=True)
+        info["status"] = r.status_code
+        info["final_url"] = r.url
+        info["redirects"] = [h.headers.get("Location") for h in r.history
+                             if h.headers.get("Location")]
+        h = {k.lower(): v for k, v in r.headers.items()}
+        info["server"] = h.get("server", "")
+        info["powered_by"] = h.get("x-powered-by", "")
+        info["content_type"] = h.get("content-type", "")
+        info["headers"] = {k: v for k, v in list(h.items())[:25]}
+        clen = h.get("content-length")
+        info["len_header"] = int(clen) if clen and clen.isdigit() else None
+
+        raw = b""
+        for chunk in r.iter_content(8192):
+            raw += chunk
+            if len(raw) > 30000 and b"</title>" in raw.lower():
+                break
+            if len(raw) >= maxbytes:
+                break
+        try:
+            r.close()
+        except Exception:
+            pass
+
+        txt = raw.decode("utf-8", "ignore")
+        info["len"] = len(raw)
+        info["body_md5"] = hashlib.md5(raw).hexdigest()
+
+        m = re.search(r"<title[^>]*>(.*?)</title>", txt, re.I | re.S)
+        info["title"] = re.sub(r"\s+", " ", m.group(1)).strip()[:200] if m else ""
+
+        low = txt.lower()
+        info["features"] = [w for w in FEATURE_WORDS if w in low]
+
+        links = re.findall(r'https?://[^\s"\'<>()\\]+', txt)
+
+        # ================= 链接分析（升级版）=================
+        from urllib.parse import urlparse as _up, unquote as _unq
+        import base64 as _b64
+
+        def _root_of(host):
+            h = (host or "").lower().split(":")[0]
+            parts = h.split(".")
+            for suf in (".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn"):
+                if h.endswith(suf):
+                    return ".".join(parts[-3:])
+            return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+        def _abs(h):
+            if not h or h.startswith("#") or h.lower().startswith("javascript:"):
+                return None
+            if h.startswith("//"):
+                return "https:" + h
+            if h.startswith("/"):
+                return urljoin(url, h)
+            if not h.startswith("http"):
+                return urljoin(url, h)
+            return h
+
+        def _is_binary(h):
+            path = _up(h).path.lower()
+            return bool(re.search(r"\." + BINARY_EXT + r"$", path, re.I))
+
+        def _netdisk(u):
+            for pat, name in NETDISK_PATTERNS:
+                if re.search(pat, u, re.I):
+                    return name
+            return None
+
+        def _try_b64(s):
+            """尝试把 base64 参数还原成 URL"""
+            s = _unq(s)
+            for pad in ("", "=", "=="):
+                try:
+                    raw = _b64.b64decode(s + pad, validate=False)
+                    txt = raw.decode("utf-8", "ignore")
+                    if txt.startswith("http"):
+                        return txt
+                except Exception:
+                    continue
+            return None
+
+        def _decode_gateway(u):
+            """解析跳转网关里的目标地址"""
+            try:
+                q = _up(u).query
+                for k in ("u", "url", "target", "to", "link", "redirect"):
+                    m = re.search(r"(?:^|&)" + k + r"=([^&]+)", q)
+                    if m:
+                        dec = _try_b64(m.group(1))
+                        if dec:
+                            return dec
+            except Exception:
+                pass
+            return None
+
+        cur_root = _root_of(_up(url).netloc.lower())
+
+        anchors = [m.group(1).strip() for m in re.finditer(
+            r'<a\b[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>', txt, re.I)]
+
+        payload_strong = []    # 外站可执行
+        payload_weak = []      # 本站可执行
+        gateways = []          # 跳转网关（含解码目标）
+        netdisks = []          # 网盘链接
+        download_pages = []    # 下载页
+        external_links = []    # 一般外链
+
+        def _handle(u):
+            try:
+                ph = _up(u).netloc.lower()
+                pr = _root_of(ph)
+            except Exception:
+                return
+            external = (pr != cur_root)
+
+            # 网盘
+            nd = _netdisk(u)
+            if nd:
+                netdisks.append({"url": u, "netdisk": nd})
+                return
+
+            # 跳转网关：域名命中特征 或 带可解码参数
+            low = u.lower()
+            if any(h in low for h in GATEWAY_HINTS) or re.search(r"[?&](u|url|target)=", low):
+                tgt = _decode_gateway(u)
+                gateways.append({"url": u, "target": tgt})
+                if tgt:
+                    nd2 = _netdisk(tgt)
+                    if nd2 and not any(x["url"] == tgt for x in netdisks):
+                        netdisks.append({"url": tgt, "netdisk": nd2,
+                                         "via": u})
+                return
+
+            binary = _is_binary(u)
+            if binary and external:
+                payload_strong.append(u)
+            elif binary:
+                payload_weak.append(u)
+            elif external:
+                external_links.append(u)
+            else:
+                if re.search(r"download|/dl/|xiazai|setup|install|下载", low):
+                    download_pages.append(u)
+
+        for h in anchors:
+            u = _abs(h)
+            if u:
+                _handle(u)
+
+        # 兜底：扫描整页文本里的绝对 URL
+        for m in re.finditer(r'https?://[^\s"\'<>()\\]+', txt):
+            _handle(m.group(0))
+
+        info["payload_strong"] = sorted(set(payload_strong))[:15]
+        info["payload_weak"] = sorted(set(payload_weak))[:15]
+        info["download_pages"] = sorted(set(download_pages))[:10]
+        info["external_links"] = sorted(set(external_links))[:20]
+
+        # 网关与网盘去重
+        seen = set()
+        g2 = []
+        for g in gateways:
+            if g["url"] not in seen:
+                seen.add(g["url"])
+                g2.append(g)
+        info["gateways"] = g2[:10]
+
+        seen = set()
+        n2 = []
+        for n in netdisks:
+            if n["url"] not in seen:
+                seen.add(n["url"])
+                n2.append(n)
+        info["netdisks"] = n2[:15]
+
+        # ---------- 从 JS / onclick 里提取下载路径 ----------
+        js_dl = set()
+        # triggerDownload(this, '/path/file.exe') / download('...') / location.href='...'
+        for m in re.finditer(
+                r"""(?:triggerDownload|downloadFile|download|startDownload|dl|goDownload)"""
+                r"""\s*\(\s*(?:this\s*,\s*)?["']([^"']{3,300}?)["']""",
+                txt, re.I):
+            js_dl.add(m.group(1))
+        # onclick / onmousedown 属性里的任意字符串路径
+        for m in re.finditer(
+                r"""on(?:click|mousedown|mouseup)\s*=\s*["']([^"']{3,400}?)["']""",
+                txt, re.I):
+            body = m.group(1)
+            for mm in re.finditer(
+                    r"""["']([^"']*\.(?:""" + BINARY_EXT + r"""))["']""",
+                    body, re.I):
+                js_dl.add(mm.group(1))
+        # window.location / location.href 赋值
+        for m in re.finditer(
+                r"""(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']{3,300}?)["']""",
+                txt, re.I):
+            js_dl.add(m.group(1))
+
+        for u in js_dl:
+            if not u:
+                continue
+            u = u.strip()
+            if u.startswith("//"):
+                u = "https:" + u
+            elif u.startswith("/"):
+                u = urljoin(url, u)
+            elif not u.startswith("http"):
+                u = urljoin(url, u)
+            low = u.lower()
+            # 只有带可执行扩展名的才算载荷
+            if not re.search(r"\.(?:%s)(\?|#|$)" % BINARY_EXT, low, re.I):
+                continue
+            try:
+                ph = _up(u).netloc.lower()
+                pr = _root_of(ph)
+                ext = (pr != cur_root)
+            except Exception:
+                ext = False
+            if ext:
+                info["payload_strong"].append(u)
+            else:
+                info["payload_weak"].append(u)
+
+        info["payload_strong"] = sorted(set(info["payload_strong"]))[:15]
+        info["payload_weak"] = sorted(set(info["payload_weak"]))[:15]
+        info["js_downloads"] = sorted(js_dl)[:20]
+
+        # ---------- 可疑外链域名（高风险 TLD + 随机串）----------
+        suspicious_hosts = []
+        try:
+            for hh in set(re.findall(r"https?://([a-z0-9\.\-]+)", txt, re.I)):
+                hh = hh.lower().split(":")[0]
+                if _root_of(hh) == cur_root:
+                    continue
+                if _risky_domain(hh):
+                    suspicious_hosts.append(hh)
+        except Exception:
+            pass
+        info["suspicious_hosts"] = sorted(set(suspicious_hosts))[:10]
+
+        info["download_links"] = sorted(
+            set(info["payload_strong"]) | set(info["payload_weak"]))[:20]
+
+        # 诱导文案
+        LURE_WORDS = ["立即下载", "马上安装", "点击下载", "免费下载", "高速下载",
+                      "电脑版下载", "客户端下载", "下载安装", "一键下载", "本地下载",
+                      "download now", "install now", "free download"]
+        info["lure_words"] = [w for w in LURE_WORDS if w in txt]
+
+        # ---------- 网盘 / 网关：全文正则（不依赖 a 标签）----------
+        def _collect_netdisk_gateway(body_text):
+            nd, gw = [], []
+            low = body_text
+            # 网盘
+            for pat, name in NETDISK_PATTERNS:
+                # 有协议头
+                for m in re.finditer(r'https?://[^\s"\'<>()\\]*?' + pat + r'[^\s"\'<>()\\]*',
+                                     low, re.I):
+                    nd.append({"url": m.group(0), "netdisk": name})
+                # 无协议头
+                for m in re.finditer(r'(?<![\w/])' + pat + r'[^\s"\'<>()\\]*',
+                                     low, re.I):
+                    u = "https://" + m.group(0)
+                    nd.append({"url": u, "netdisk": name})
+            # 网关（含 base64 目标）
+            for m in re.finditer(r'https?://[^\s"\'<>()\\]*(?:go|down|dl|jump)\.php[^\s"\'<>()\\]*',
+                                 low, re.I):
+                u = m.group(0)
+                tg = _decode_gateway(u)
+                gw.append({"url": u, "target": tg})
+                if tg:
+                    for pat, name in NETDISK_PATTERNS:
+                        if re.search(pat, tg, re.I):
+                            nd.append({"url": tg, "netdisk": name, "via": u})
+                            break
+            # 域名里带 hhxiazai / tj. 之类
+            for m in re.finditer(r'https?://[^\s"\'<>()\\]*(?:hhxiazai|xiazai)[^\s"\'<>()\\]*',
+                                 low, re.I):
+                u = m.group(0)
+                if not any(g["url"] == u for g in gw):
+                    gw.append({"url": u, "target": _decode_gateway(u)})
+            return nd, gw
+
+        nd2, gw2 = _collect_netdisk_gateway(txt)
+        for x in nd2:
+            if not any(y["url"] == x["url"] for y in netdisks):
+                netdisks.append(x)
+        for x in gw2:
+            if not any(y["url"] == x["url"] for y in gateways):
+                gateways.append(x)
+
+        # 重新去重
+        seen = set()
+        n3 = []
+        for n in netdisks:
+            if n["url"] not in seen:
+                seen.add(n["url"])
+                n3.append(n)
+        info["netdisks"] = n3[:15]
+
+        seen = set()
+        g3 = []
+        for g in gateways:
+            if g["url"] not in seen:
+                seen.add(g["url"])
+                g3.append(g)
+        info["gateways"] = g3[:10]
+
+        # ---------- 是否引用了品牌真官网（严格判定）----------
+        info["refs_official"] = []
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            bf = _P(__file__).resolve().parent / "brands.json"
+            bdata = _json.loads(bf.read_text(encoding="utf-8"))
+
+            hosts = set(h.lower() for h in
+                        re.findall(r'(?<![\w.\-])([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)+)',
+                                   txt, re.I))
+            hosts = {h for h in hosts if "." in h}
+
+            for b in bdata.get("brands", []):
+                for o in b.get("official", []):
+                    oh = o.lower().split("/")[0].strip()
+                    if not oh or oh in ("github.com", "sourceforge.net"):
+                        continue
+                    if oh in PUBLIC_PLATFORM_HOSTS:
+                        continue
+                    if oh == cur_root:
+                        continue
+                    # 必须是完整匹配某 host
+                    if oh in hosts:
+                        info["refs_official"].append(
+                            {"brand": b.get("name"), "host": oh})
+                        break
+        except Exception:
+            pass
+
+        # ---------- 二层：抓下载页，合并所有发现 ----------
+        if not info["payload_strong"] and download_pages[:3]:
+            merged_nd = list(info.get("netdisks") or [])
+            merged_gw = list(info.get("gateways") or [])
+            merged_ps = []
+            merged_pw = []
+
+            for dp in download_pages[:3]:
+                try:
+                    r2 = requests.get(dp, headers={"User-Agent": UA, "Referer": url},
+                                      timeout=10, verify=False)
+                    if r2.status_code >= 400:
+                        continue
+                    t2 = r2.text
+
+                    # 复用同一套识别逻辑
+                    nd2, gw2 = _collect_netdisk_gateway(t2)
+                    for x in nd2:
+                        if not any(y["url"] == x["url"] for y in merged_nd):
+                            merged_nd.append(x)
+                    for x in gw2:
+                        if not any(y["url"] == x["url"] for y in merged_gw):
+                            merged_gw.append(x)
+
+                    # 直链可执行
+                    for m in re.finditer(
+                            r'https?://[^\s"\'<>()\\]+?\.' + BINARY_EXT, t2, re.I):
+                        u2 = m.group(0)
+                        try:
+                            ext = (_root_of(_up(u2).netloc) != cur_root)
+                        except Exception:
+                            ext = False
+                        (merged_ps if ext else merged_pw).append(u2)
+
+                    # href 相对路径可执行
+                    for m in re.finditer(
+                            r'["\']([^"\']{3,200}?\.' + BINARY_EXT + r')["\']', t2, re.I):
+                        u2 = _abs(m.group(1))
+                        if u2:
+                            merged_pw.append(u2)
+
+                except Exception:
+                    pass
+
+            if merged_ps:
+                info["payload_strong"] = sorted(set(merged_ps))[:15]
+            if merged_pw:
+                info["payload_weak"] = sorted(set(merged_pw + (info.get("payload_weak") or [])))[:15]
+            info["payload_deep"] = sorted(set(merged_ps))[:15]
+            if merged_ps:
+                info["download_links"] = info["payload_strong"]
+            elif merged_pw:
+                info["download_links"] = info["payload_weak"]
+
+            # 网盘 / 网关合并
+            seen = set()
+            n3 = []
+            for n in merged_nd:
+                if n["url"] not in seen:
+                    seen.add(n["url"])
+                    n3.append(n)
+            info["netdisks"] = n3[:15]
+
+            seen = set()
+            g3 = []
+            for g in merged_gw:
+                if g["url"] not in seen:
+                    seen.add(g["url"])
+                    g3.append(g)
+            info["gateways"] = g3[:10]
+
+        info["buckets"] = sorted({
+            re.sub(r"^https?://", "", l).split("/")[0]
+            for l in links
+            if re.search(r"(oss|tos|cos|kodo)[a-z0-9\-]*\.(aliyuncs|volces|myqcloud|clouddn)\.com",
+                         l, re.I)
+        })[:10]
+
+        info["out_domains"] = sorted({
+            re.sub(r"^https?://", "", l).split("/")[0].lower()
+            for l in links
+        })[:40]
+
+        info["body_head"] = re.sub(r"\s+", " ", txt)[:600]
+        info.update(_extract_favicon(txt, url))
+        info["html"] = txt[:maxbytes]
+
+    except requests.exceptions.SSLError as e:
+        info["error"] = "SSL: " + str(e)[:100]
+    except requests.exceptions.ConnectTimeout:
+        info["error"] = "连接超时"
+    except requests.exceptions.ReadTimeout:
+        info["error"] = "读取超时"
+    except requests.exceptions.ConnectionError as e:
+        info["error"] = "连接失败: " + str(e)[:80]
+    except Exception as e:
+        info["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+    return info
+
+
+def cert_probe(domain, timeout=8):
+    """TLS 证书明细"""
+    info = {}
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((domain, 443), timeout=timeout) as sk:
+            with ctx.wrap_socket(sk, server_hostname=domain) as ss:
+                der = ss.getpeercert(binary_form=True)
+                if not der:
+                    return {"error": "空证书"}
+                info["sha256"] = hashlib.sha256(der).hexdigest()
+                info["tls_version"] = ss.version()
+                try:
+                    from cryptography import x509
+                    from cryptography.hazmat.backends import default_backend
+                    c = x509.load_der_x509_certificate(der, default_backend())
+                    info["subject"] = c.subject.rfc4514_string()
+                    info["issuer"] = c.issuer.rfc4514_string()
+                    info["not_before"] = str(c.not_valid_before_utc)[:19]
+                    info["not_after"] = str(c.not_valid_after_utc)[:19]
+                    info["serial"] = str(c.serial_number)
+                    try:
+                        oid = x509.oid.NameOID.ORGANIZATION_NAME
+                        info["issuer_org"] = c.issuer.get_attributes_for_oid(oid)[0].value
+                    except Exception:
+                        info["issuer_org"] = ""
+                    try:
+                        san = c.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                        info["san"] = san.value.get_values_for_type(x509.DNSName)[:30]
+                    except Exception:
+                        info["san"] = []
+                except Exception as e:
+                    info["decode_error"] = str(e)[:80]
+    except Exception as e:
+        info["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+    return info
+
+
+def collect_http(domain):
+    """
+    http + https 都试，但以 https 为优先。
+    三级重试：
+      1) https + 标准 UA
+      2) https + 换 UA + Referer
+      3) http  + 标准 UA
+    任一级拿到 200 就停止。
+    """
+    import random
+    import time
+
+    out = {}
+
+    def _try(scheme, ua=None, referer=None):
+        url = "%s://%s/" % (scheme, domain)
+        res = http_probe(url, ua=ua, referer=referer)
+        out.setdefault(scheme, res)
+        if res.get("status") and res.get("status") < 400:
+            out[scheme] = res
+            return res
+        # 保留第一次的记录，避免被后续失败覆盖掉有用信息
+        if not out[scheme].get("status"):
+            out[scheme] = res
+        return None
+
+    # 1) https + 标准 UA
+    got = _try("https")
+    if got:
+        return out, got
+
+    # 2) https + 换 UA + Referer
+    time.sleep(random.uniform(0.8, 1.6))
+    got = _try("https", ua=UA_POOL[1], referer="https://www.google.com/")
+    if got:
+        return out, got
+
+    # 3) http + 标准 UA（最后降级）
+    time.sleep(random.uniform(0.5, 1.2))
+    got = _try("http")
+    if got:
+        return out, got
+
+    # 4) 全失败，也给一次 http + 换 UA 的机会
+    time.sleep(random.uniform(0.5, 1.0))
+    got = _try("http", ua=UA_POOL[2], referer="https://www.bing.com/")
+    if got:
+        return out, got
+
+    # 全失败：返回已有记录里信息最多的那个
+    best = None
+    for v in out.values():
+        if v.get("status") or v.get("title") or v.get("len"):
+            best = v
+            break
+    return out, best

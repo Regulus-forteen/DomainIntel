@@ -1,0 +1,538 @@
+{
+  "_comment": "知名品牌官方域名白名单 / 仿冒目标库。official 为该品牌的官方域名，aliases 为常见别称（用于相似度比对）。可以随时增删。",
+  "brands": [
+    {
+      "name": "Typora",
+      "official": [
+        "typora.io"
+      ],
+      "aliases": [
+        "typora"
+      ]
+    },
+    {
+      "name": "NexusMods",
+      "official": [
+        "nexusmods.com"
+      ],
+      "aliases": [
+        "nexusmods",
+        "nexus",
+        "mods"
+      ]
+    },
+    {
+      "name": "DeepSeek",
+      "official": [
+        "deepseek.com"
+      ],
+      "aliases": [
+        "deepseek",
+        "deepseek-v3",
+        "deepseek-r1"
+      ]
+    },
+    {
+      "name": "火绒安全",
+      "official": [
+        "huorong.cn"
+      ],
+      "aliases": [
+        "huorong"
+      ]
+    },
+    {
+      "name": "网易UU",
+      "official": [
+        "uu.163.com"
+      ],
+      "aliases": [
+        "uu",
+        "163",
+        "uubooster"
+      ]
+    },
+    {
+      "name": "腾讯元宝",
+      "official": [
+        "yuanbao.tencent.com"
+      ],
+      "aliases": [
+        "yuanbao"
+      ]
+    },
+    {
+      "name": "豆包",
+      "official": [
+        "doubao.com"
+      ],
+      "aliases": [
+        "doubao"
+      ]
+    },
+    {
+      "name": "通义千问",
+      "official": [
+        "tongyi.aliyun.com"
+      ],
+      "aliases": [
+        "qianwen",
+        "tongyi"
+      ]
+    },
+    {
+      "name": "夸克",
+      "official": [
+        "quark.cn"
+      ],
+      "aliases": [
+        "quark"
+      ]
+    },
+    {
+      "name": "飞书",
+      "official": [
+        "feishu.cn"
+      ],
+      "aliases": [
+        "feishu",
+        "larksuite"
+      ]
+    },
+    {
+      "name": "钉钉",
+      "official": [
+        "dingtalk.com"
+      ],
+      "aliases": [
+        "dingtalk",
+        "dingding"
+      ]
+    },
+    {
+      "name": "剪映",
+      "official": [
+        "jianying.com"
+      ],
+      "aliases": [
+        "jianying",
+        "capcut"
+      ]
+    },
+    {
+      "name": "百度网盘",
+      "official": [
+        "pan.baidu.com"
+      ],
+      "aliases": [
+        "baidupan",
+        "baidu"
+      ]
+    },
+    {
+      "name": "360浏览器",
+      "official": [
+        "browser.360.cn"
+      ],
+      "aliases": [
+        "360",
+        "360browser"
+      ]
+    },
+    {
+      "name": "KOOK",
+      "official": [
+        "kookapp.cn"
+      ],
+      "aliases": [
+        "kook"
+      ]
+    },
+    {
+      "name": "ToDesk",
+      "official": [
+        "todesk.com"
+      ],
+      "aliases": [
+        "todesk"
+      ]
+    },
+    {
+      "name": "ProtonVPN",
+      "official": [
+        "protonvpn.com",
+        "proton.me"
+      ],
+      "aliases": [
+        "proton",
+        "protonvpn"
+      ]
+    },
+    {
+      "name": "Surfshark",
+      "official": [
+        "surfshark.com"
+      ],
+      "aliases": [
+        "surfshark"
+      ]
+    },
+    {
+      "name": "StrongVPN",
+      "official": [
+        "strongvpn.com"
+      ],
+      "aliases": [
+        "strongvpn"
+      ]
+    },
+    {
+      "name": "ZoogVPN",
+      "official": [
+        "zoogvpn.com"
+      ],
+      "aliases": [
+        "zoogvpn"
+      ]
+    },
+    {
+      "name": "X-VPN",
+      "official": [
+        "xvpn.io"
+      ],
+      "aliases": [
+        "xvpn",
+        "x-vpn"
+      ]
+    },
+    {
+      "name": "V2RayN",
+      "official": [
+        "github.com/2dust/v2rayN"
+      ],
+      "aliases": [
+        "v2rayn",
+        "v2ray"
+      ]
+    },
+    {
+      "name": "快橙VPN",
+      "official": [],
+      "aliases": [
+        "fireorange",
+        "kuaicheng"
+      ]
+    },
+    {
+      "name": "快喵VPN",
+      "official": [],
+      "aliases": [
+        "kuaimiao",
+        "acekuaimiao"
+      ]
+    },
+    {
+      "name": "Telegram",
+      "official": [
+        "telegram.org"
+      ],
+      "aliases": [
+        "telegram",
+        "tme"
+      ]
+    },
+    {
+      "name": "WPS",
+      "official": [
+        "wps.cn"
+      ],
+      "aliases": [
+        "wps"
+      ]
+    },
+    {
+      "name": "微信",
+      "official": [
+        "weixin.qq.com",
+        "wechat.com"
+      ],
+      "aliases": [
+        "weixin",
+        "wechat"
+      ]
+    },
+    {
+      "name": "QQ",
+      "official": [
+        "qq.com"
+      ],
+      "aliases": [
+        "qq"
+      ]
+    },
+    {
+      "name": "腾讯会议",
+      "official": [
+        "meeting.tencent.com"
+      ],
+      "aliases": [
+        "tencentmeeting"
+      ]
+    },
+    {
+      "name": "向日葵",
+      "official": [
+        "oray.com"
+      ],
+      "aliases": [
+        "oray",
+        "sunlogin"
+      ]
+    },
+    {
+      "name": "TeamViewer",
+      "official": [
+        "teamviewer.com"
+      ],
+      "aliases": [
+        "teamviewer"
+      ]
+    },
+    {
+      "name": "AnyDesk",
+      "official": [
+        "anydesk.com"
+      ],
+      "aliases": [
+        "anydesk"
+      ]
+    },
+    {
+      "name": "Chrome",
+      "official": [
+        "google.com/chrome"
+      ],
+      "aliases": [
+        "chrome",
+        "googlechrome"
+      ]
+    },
+    {
+      "name": "Edge",
+      "official": [
+        "microsoft.com/edge"
+      ],
+      "aliases": [
+        "edge",
+        "msedge"
+      ]
+    },
+    {
+      "name": "Firefox",
+      "official": [
+        "mozilla.org"
+      ],
+      "aliases": [
+        "firefox",
+        "mozilla"
+      ]
+    },
+    {
+      "name": "Adobe",
+      "official": [
+        "adobe.com"
+      ],
+      "aliases": [
+        "adobe",
+        "photoshop",
+        "acrobat"
+      ]
+    },
+    {
+      "name": "Office",
+      "official": [
+        "office.com"
+      ],
+      "aliases": [
+        "office",
+        "microsoftoffice"
+      ]
+    },
+    {
+      "name": "Steam",
+      "official": [
+        "steampowered.com"
+      ],
+      "aliases": [
+        "steam"
+      ]
+    },
+    {
+      "name": "Discord",
+      "official": [
+        "discord.com"
+      ],
+      "aliases": [
+        "discord"
+      ]
+    },
+    {
+      "name": "Zoom",
+      "official": [
+        "zoom.us"
+      ],
+      "aliases": [
+        "zoom"
+      ]
+    },
+    {
+      "name": "OBS",
+      "official": [
+        "obsproject.com"
+      ],
+      "aliases": [
+        "obs",
+        "obsstudio"
+      ]
+    },
+    {
+      "name": "PotPlayer",
+      "official": [
+        "potplayer.daum.net"
+      ],
+      "aliases": [
+        "potplayer"
+      ]
+    },
+    {
+      "name": "IDM",
+      "official": [
+        "internetdownloadmanager.com"
+      ],
+      "aliases": [
+        "idm",
+        "internetdownloadmanager"
+      ]
+    },
+    {
+      "name": "WinRAR",
+      "official": [
+        "rarlab.com"
+      ],
+      "aliases": [
+        "winrar",
+        "rarlab"
+      ]
+    },
+    {
+      "name": "Notepad++",
+      "official": [
+        "notepad-plus-plus.org"
+      ],
+      "aliases": [
+        "notepadplusplus",
+        "notepad"
+      ]
+    },
+    {
+      "name": "VS Code",
+      "official": [
+        "code.visualstudio.com"
+      ],
+      "aliases": [
+        "vscode",
+        "visualstudiocode"
+      ]
+    },
+    {
+      "name": "Git",
+      "official": [
+        "git-scm.com"
+      ],
+      "aliases": [
+        "git"
+      ]
+    },
+    {
+      "name": "Python",
+      "official": [
+        "python.org"
+      ],
+      "aliases": [
+        "python"
+      ]
+    },
+    {
+      "name": "金山毒霸",
+      "official": [
+        "duba.net"
+      ],
+      "aliases": [
+        "duba",
+        "jinshan"
+      ]
+    },
+    {
+      "name": "腾讯电脑管家",
+      "official": [
+        "guanjia.qq.com"
+      ],
+      "aliases": [
+        "guanjia",
+        "qqpcmgr"
+      ]
+    },
+    {
+      "name": "Dism++",
+      "official": [
+        "chuyu.me"
+      ],
+      "aliases": [
+        "dism",
+        "dism++"
+      ]
+    }
+  ],
+  "safe_registrars": [
+    "Gandi SAS",
+    "MarkMonitor",
+    "CSC Corporate Domains",
+    "Network Solutions",
+    "GoDaddy.com, LLC",
+    "Namecheap, Inc.",
+    "Google LLC",
+    "Amazon Registrar",
+    "Alibaba Cloud Computing",
+    "HiChina Zhicheng",
+    "eName Technology",
+    "Xin Net Technology"
+  ],
+  "haven_registrars": [
+    "Rumahweb",
+    "Web Commerce Communications",
+    "Key-Systems",
+    "NameSilo",
+    "Namecheap, Inc.",
+    "PDR Ltd",
+    "Dynadot",
+    "Gname.com",
+    "Realtime Register",
+    "Hostinger",
+    "NameSilo, LLC",
+    "Sav.com",
+    "Porkbun",
+    "Hosting Concepts B.V.",
+    "EDOMS LLC",
+    "Registrar of Domain Names REG.RU",
+    "PDR",
+    "Tucows"
+  ],
+  "privacy_placeholder_emails": [
+    "info@domain-contact.org",
+    "abuse@",
+    "privacy@",
+    "protect@",
+    "redacted",
+    "withheldforprivacy"
+  ]
+}
