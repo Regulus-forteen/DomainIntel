@@ -205,32 +205,97 @@ def upload_file(path, timeout=300):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:100])}
 
 
-def get_analysis(analysis_id, wait=300, interval=20):
+def get_analysis(analysis_id, wait=300, interval=15):
     """
     轮询分析结果，最多等 wait 秒
+    返回 {ok, completed, stats, engines, label, categories, sha256, error}
     """
     deadline = time.time() + wait
+    last_err = None
     while time.time() < deadline:
         _limiter.wait()
         try:
             r = requests.get("%s/analyses/%s" % (VT_BASE, analysis_id),
                              headers=_headers(), timeout=30, verify=False)
+            if r.status_code == 401:
+                return {"ok": False, "error": "API Key 无效"}
+            if r.status_code == 429:
+                last_err = "触发限流"
+                time.sleep(20)
+                continue
             if r.status_code != 200:
-                return {"ok": False, "error": "HTTP %s" % r.status_code}
+                last_err = "HTTP %s" % r.status_code
+                time.sleep(interval)
+                continue
+
             j = r.json()
             attr = (j.get("data") or {}).get("attributes") or {}
             status = attr.get("status")
-            if status == "completed":
-                stats = attr.get("stats") or {}
-                return {"ok": True, "completed": True,
-                        "stats": stats,
-                        "sha256": ((attr.get("results") or {}) and
-                                   list((attr.get("results") or {}).values())[0].get("meta", {}).get("file_info", {}).get("sha256")),
-                        "raw": attr}
-            time.sleep(interval)
+
+            if status != "completed":
+                time.sleep(interval)
+                continue
+
+            stats = attr.get("stats") or {}
+            results = attr.get("results") or {}
+
+            # 引擎明细（只留报毒/可疑）
+            engines = []
+            for eng, v in results.items():
+                if not isinstance(v, dict):
+                    continue
+                cat = v.get("category")
+                if cat in ("malicious", "suspicious"):
+                    engines.append({
+                        "engine": v.get("engine_name") or eng,
+                        "result": v.get("result") or "",
+                        "category": cat,
+                    })
+            engines.sort(key=lambda x: (x["category"] != "malicious",
+                                        x["engine"].lower()))
+
+            # 元信息
+            meta = (j.get("data") or {}).get("meta") or {}
+            finfo = meta.get("file_info") or {}
+            sha = finfo.get("sha256") or ""
+            name = finfo.get("display_name") or finfo.get("name") or ""
+
+            # 从报毒结果里推断威胁类型
+            label = ""
+            cats = {}
+            for e in engines[:20]:
+                r_ = (e.get("result") or "").lower()
+                if "trojan" in r_:
+                    cats["trojan"] = cats.get("trojan", 0) + 1
+                elif "backdoor" in r_:
+                    cats["backdoor"] = cats.get("backdoor", 0) + 1
+                elif "ransom" in r_:
+                    cats["ransom"] = cats.get("ransom", 0) + 1
+                elif "miner" in r_ or "coin" in r_:
+                    cats["miner"] = cats.get("miner", 0) + 1
+                elif "worm" in r_:
+                    cats["worm"] = cats.get("worm", 0) + 1
+                elif "adware" in r_:
+                    cats["adware"] = cats.get("adware", 0) + 1
+            if cats:
+                label = max(cats.items(), key=lambda x: x[1])[0]
+
+            return {
+                "ok": True,
+                "completed": True,
+                "stats": stats,
+                "engines": engines,
+                "label": label,
+                "sha256": sha,
+                "filename": name,
+                "error": None,
+            }
+
         except Exception as e:
-            return {"ok": False, "error": str(e)[:100]}
-    return {"ok": False, "error": "分析超时（%d 秒未完成）" % wait}
+            last_err = "%s: %s" % (type(e).__name__, str(e)[:80])
+            time.sleep(interval)
+
+    return {"ok": False, "error": last_err or "分析超时（%d 秒未完成）" % wait}
 
 
 def quota_stat():

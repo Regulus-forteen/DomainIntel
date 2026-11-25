@@ -33,6 +33,15 @@ UA_POOL = [
 # 可执行 / 压缩包扩展名（不含 html、php 等页面）
 BINARY_EXT = r"(?:exe|zip|rar|7z|msi|apk|dmg|pkg|tar|gz|cab)"
 
+# Serverless / 免费托管平台（黑产常用来做载荷分发，域名随时可换）
+SERVERLESS_HOSTS = (
+    "workers.dev", "pages.dev", "vercel.app", "netlify.app", "herokuapp.com",
+    "glitch.me", "repl.co", "deno.dev", "fly.dev", "onrender.com",
+    "web.app", "firebaseapp.com", "r2.dev", "azurewebsites.net",
+    "cloudfront.net", "github.io", "gitlab.io", "surge.sh", "now.sh",
+)
+
+
 # 高风险 TLD（注册便宜、滥用率高）
 RISKY_TLDS = ("cyou", "top", "xyz", "icu", "buzz", "click", "shop", "vip",
               "work", "loan", "men", "gq", "tk", "ml", "cf", "ga", "rest",
@@ -412,6 +421,85 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
         info["payload_strong"] = sorted(set(info["payload_strong"]))[:15]
         info["payload_weak"] = sorted(set(info["payload_weak"]))[:15]
         info["js_downloads"] = sorted(js_dl)[:20]
+
+        # ---------- ① 结构化数据里的 downloadUrl ----------
+        ld_downloads = []
+        for m in re.finditer(
+                r'<script[^>]+type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                txt, re.I | re.S):
+            body = m.group(1)
+            # 直接正则抓 downloadUrl（不依赖 json 解析，容忍脏数据）
+            for dm in re.finditer(r'"downloadUrl"\s*:\s*"([^"]+)"', body, re.I):
+                ld_downloads.append(dm.group(1))
+            # 也抓 contentUrl / url 里带扩展名的
+            for dm in re.finditer(
+                    r'"(?:contentUrl|fileUrl|installUrl)"\s*:\s*"([^"]+)"', body, re.I):
+                ld_downloads.append(dm.group(1))
+
+        # ---------- ② data-* 线索 ----------
+        data_hints = []
+        for m in re.finditer(
+                r'data-(?:dl|file|url|href|src|link|download|pkg|app)\s*=\s*["\']([^"\']{1,120})["\']',
+                txt, re.I):
+            v = m.group(1).strip()
+            if v and v not in data_hints:
+                data_hints.append(v)
+        # 从 onclick 里抓 data-* 引用
+        for m in re.finditer(r"dataset\.(?:dl|file|url|href|link)", txt, re.I):
+            pass  # 仅作存在性标记，下面用 data_hints 是否为空判断
+
+        # ---------- ③ JS 映射表：{"sunlogim": "https://...exe"} ----------
+        js_map = {}
+        for m in re.finditer(
+                r'["\']([a-z0-9_\-]{3,40})["\']\s*:\s*["\'](https?://[^"\']{6,300}?)["\']',
+                txt, re.I):
+            key, val = m.group(1), m.group(2)
+            if re.search(r"\.(?:%s)" % BINARY_EXT, val, re.I) or \
+                    any(h in val.lower() for h in SERVERLESS_HOSTS):
+                js_map[key] = val
+
+        # 用 data-dl 的值去映射表里查
+        for hint in data_hints:
+            if hint in js_map:
+                ld_downloads.append(js_map[hint])
+
+        # ---------- ④ JS 拼接：'prefix' + xxx.data-dl + '.exe' ----------
+        js_concat = []
+        for m in re.finditer(
+                r"""["']((?:https?://|/)[^"']{0,120}?)["']\s*\+\s*[\w$.]*(?:dataset\.)?(?:dl|file|url|href)\b\s*\+\s*["']([^"']{0,40})["']""",
+                txt, re.I):
+            prefix, suffix = m.group(1), m.group(2)
+            if any(h in prefix for h in data_hints[:3]):
+                continue
+            for hint in data_hints[:3]:
+                js_concat.append(prefix + hint + suffix)
+
+        # ---------- ⑤ 汇总到载荷列表 ----------
+        for u in ld_downloads + js_concat:
+            if not u:
+                continue
+            if not u.startswith("http"):
+                u = urljoin(url, u)
+            try:
+                low = u.lower()
+                host = _up(u).netloc.lower()
+                is_serveless = any(h in host for h in SERVERLESS_HOSTS)
+                is_bin = bool(re.search(r"\.(?:%s)" % BINARY_EXT, low, re.I))
+                # 结构化数据的 downloadUrl 即便无扩展名也算载荷线索
+                if is_bin or is_serveless:
+                    if is_serveless:
+                        info.setdefault("serverless_payload", []).append(u)
+                    if _root_of(host) != cur_root:
+                        info["payload_strong"].append(u)
+                    else:
+                        info["payload_weak"].append(u)
+            except Exception:
+                continue
+
+        info["ld_downloads"] = sorted(set(ld_downloads))[:10]
+        info["data_hints"] = data_hints[:15]
+        info["js_map_hits"] = sorted(set(js_map.values()))[:10]
+        info["serverless_payload"] = sorted(set(info.get("serverless_payload") or []))[:10]
 
         # ---------- 可疑外链域名（高风险 TLD + 随机串）----------
         suspicious_hosts = []

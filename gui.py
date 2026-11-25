@@ -263,33 +263,49 @@ def build_sections(r, done_stages):
 
     S.append(("载荷设施", rows))
 
-    # ---- 载荷分析（VT）----
+    # ---- 载荷分析（VT）——独立分区，字段固定，避免动态标签导致控件错位 ----
     pa = r.get("payload_analysis") or []
-    if pa:
-        prow = []
-        for i, x in enumerate(pa[:4], 1):
+    prow = []
+    for i in range(4):
+        if i < len(pa):
+            x = pa[i]
             v = x.get("vt") or {}
             st = v.get("stats") or {}
+            mal = st.get("malicious", 0)
+            tot = st.get("total", 0)
+
+            prow.append(("载荷 %d 文件" % (i + 1),
+                         val("score", "%s（%s，%s）"
+                             % ((x.get("filename") or "-")[:30],
+                                x.get("kind") or "-",
+                                ("%.1f MB" % (x.get("size", 0) / 1048576))
+                                if x.get("size") else "-"))))
             if v.get("found"):
-                score = "%d/%d 报毒" % (st.get("malicious", 0), st.get("total", 0))
+                vt_txt = "%d/%d 引擎报毒" % (mal, tot)
+                if mal == 0:
+                    vt_txt = "0/%d 无引擎报毒" % tot
+                prow.append(("载荷 %d VT结果" % (i + 1), val("score", vt_txt)))
+            elif v.get("upload_failed"):
+                prow.append(("载荷 %d VT结果" % (i + 1),
+                             val("score", "上传失败：%s" % (v.get("error") or "")[:30])))
             elif v.get("error"):
-                score = v["error"][:24]
+                prow.append(("载荷 %d VT结果" % (i + 1),
+                             val("score", "查询失败：%s" % v["error"][:30])))
             else:
-                score = "无记录"
-            prow.append(("载荷 %d 文件" % i,
-                         "%s（%s %s）" % ((x.get("filename") or "")[:26],
-                                          (x.get("kind") or ""),
-                                          ("%.1fMB" % (x.get("size", 0) / 1048576))
-                                          if x.get("size") else "-")))
-            prow.append(("载荷 %d SHA256" % i, (x.get("sha256") or "-")[:48]))
-            prow.append(("载荷 %d VT" % i, score))
-            if v.get("label"):
-                prow.append(("载荷 %d 威胁类型" % i, v["label"]))
-            if x.get("uploaded"):
-                prow.append(("载荷 %d 已上传" % i, "是"))
-            prow.append(("载荷 %d 本地" % i,
-                         "已删除" if x.get("deleted") else "未删除"))
-        S.append(("载荷分析", prow))
+                prow.append(("载荷 %d VT结果" % (i + 1), val("score", "无记录")))
+
+            prow.append(("载荷 %d 威胁类型" % (i + 1),
+                         val("score", v.get("label") or None)))
+            prow.append(("载荷 %d SHA256" % (i + 1),
+                         val("score", (x.get("sha256") or "-")[:64])))
+            prow.append(("载荷 %d 状态" % (i + 1),
+                         val("score", "已上传" if x.get("uploaded") else "库中已有")))
+            prow.append(("载荷 %d 本地" % (i + 1),
+                         val("score", "已删除" if x.get("deleted") else "未删除")))
+        else:
+            for f in ("文件", "VT结果", "威胁类型", "SHA256", "状态", "本地"):
+                prow.append(("载荷 %d %s" % (i + 1, f), ""))
+    S.append(("载荷分析", prow))
 
     # ---- 多节点 ----
     if mn:
@@ -483,8 +499,16 @@ class App(tk.Tk):
         vsb2.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._on_tree_dbl)
 
-        self.status = ttk.Label(self, text="就绪", anchor="w", relief="sunken")
-        self.status.pack(fill="x", side="bottom")# ================= 字段渲染 =================
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", side="bottom")
+
+        self.status = ttk.Label(bottom, text="就绪", anchor="w", relief="sunken")
+        self.status.pack(side="left", fill="x", expand=True)
+
+        self.lbl_quota = ttk.Label(bottom, text="", anchor="e",
+                                   relief="sunken", width=28)
+        self.lbl_quota.pack(side="right")
+        self._update_quota()# ================= 字段渲染 =================
     def _render_placeholder(self):
         """无选中域名时，把字段区按骨架画出来（值留空）"""
         sections = build_sections({"domain": "", "risk": {}, "dns": {}}, set())
@@ -1057,15 +1081,20 @@ class App(tk.Tk):
 
         payloads = payload_mod.collect_payloads(self.results, only_risky=True)
         if not payloads:
-            messagebox.showinfo("提示", "未发现可分析的载荷链接")
+            nd_items = []
+            for r in self.results:
+                for n in ((r.get("http_best") or {}).get("netdisks") or []):
+                    nd_items.append("[%s] %s" % (n.get("netdisk", ""), n["url"]))
 
-            # 仍提示网盘情况
-            nd_count = sum(len((r.get("http_best") or {}).get("netdisks") or [])
-                           for r in self.results)
-            if nd_count:
-                messagebox.showinfo(
-                    "说明", "发现 %d 条网盘分发链接（百度/UC/夸克等）。\n"
-                    "网盘链接无法直接下载，需人工处理。" % nd_count)
+            msg = "未发现可自动分析的载荷链接（需要直链 .exe/.zip 等）"
+            if nd_items:
+                msg += ("\n\n发现 %d 条网盘分发链接，脚本无法直接下载：\n\n"
+                        % len(nd_items))
+                msg += "\n".join(nd_items[:6])
+                if len(nd_items) > 6:
+                    msg += "\n…（共 %d 条）" % len(nd_items)
+                msg += "\n\n网盘需要人工登录/提取码下载，请手动获取后分析。"
+            messagebox.showwarning("无可用载荷", msg)
             return
 
         if not messagebox.askyesno(
@@ -1138,6 +1167,7 @@ class App(tk.Tk):
                "  新上传 %d 个\n"
                "  本地已删除 %d 个" % (len(results), ok_n, mal_n, up_n, del_n))
         self.status.config(text=msg.replace("\n", " | "))
+        self._update_quota()
         messagebox.showinfo("载荷分析完成", msg)
 
         # 把结果挂到对应域名，并刷新视图
@@ -1220,6 +1250,16 @@ class App(tk.Tk):
 
     def _open_ct(self):
         CTWindow(self)
+
+    def _update_quota(self):
+        """刷新 VT 配额显示"""
+        try:
+            from core import vt as _vt
+            q = _vt.quota_stat()
+            self.lbl_quota.config(
+                text="VT 配额 %d/%d" % (q.get("今日已用", 0), q.get("每日上限", 500)))
+        except Exception:
+            self.lbl_quota.config(text="")
 
     def _on_close(self):
         if self.working:

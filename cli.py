@@ -15,8 +15,7 @@ import threading
 import argparse
 import datetime
 from pathlib import Path
-from collections import Counter
-
+from collections import Counter, defaultdict
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
@@ -262,7 +261,7 @@ def run(args):
 
     banner()
 
-    domains = parse_domains_arg(args.domains or args.d)
+    domains = parse_domains_arg(args.domains)
     if not domains:
         print(C.RED + "  ✗ 未解析出有效域名" + C.R)
         return 1
@@ -361,7 +360,13 @@ def run(args):
     print()
 
     # ============ 阶段 2：载荷分析 ============
-    if not args.no_payload:
+    do_payload = (not args.no_payload) or args.vt
+    if args.vt:
+        do_payload = True
+    if args.no_payload and not args.vt:
+        do_payload = False
+
+    if do_payload:
         payloads = payload_mod.collect_payloads(results, only_risky=True)
         if payloads:
             print(C.B + "  ╭─ 阶段 2/3  载荷分析（VirusTotal） " + "─" * 32 + C.R)
@@ -397,10 +402,33 @@ def run(args):
                     tag = "%s无记录%s" % (C.GRY, C.R)
                 sp.stop("  %s✓%s %s %s" % (C.GRN, C.R, url[:56], tag))
 
+            # 挂回域名 + 重新评分（VT 报毒 +50 在这里生效）
             for x in presults:
                 for r in results:
                     if r["domain"] == x.get("domain"):
                         r.setdefault("payload_analysis", []).append(x)
+
+            from core import scoring as _sc
+            rescored = 0
+            for r in results:
+                if r.get("payload_analysis"):
+                    old_score = (r.get("risk") or {}).get("score", 0)
+                    r["risk"] = _sc.score_v2(r)
+                    if (r["risk"].get("score", 0) != old_score):
+                        rescored += 1
+            if rescored:
+                print()
+                print("  %sVT 结果已并入评分，%d 个域名分数发生变化：%s"
+                      % (C.GRN, rescored, C.R))
+                for r in sorted(results, key=lambda x: -(x.get("risk") or {}).get("score", 0)):
+                    rk = r.get("risk") or {}
+                    col = LEVEL_COLOR.get(rk.get("level", ""), "")
+                    print("    %-30s %s%3d %s%s" % (
+                        r["domain"][:30], col, rk.get("score", 0),
+                        rk.get("level", ""), C.R))
+                # 更新统计
+                lv2 = Counter((r.get("risk") or {}).get("level", "未知") for r in results)
+                stats["by_level"] = dict(lv2)
 
             print()
             for x in presults:
@@ -539,8 +567,10 @@ def main():
   python cli.py domains.txt --no-payload --no-mail
   python cli.py domains.txt --send
 """)
-    ap.add_argument("domains", nargs="?", help="域名列表文件或逗号分隔域名")
-    ap.add_argument("-d", "--domains", help="同上（命名参数）")
+    ap.add_argument("domains", nargs="?",
+                    help="域名列表文件或逗号分隔域名")
+    ap.add_argument("-d", "--domain-list", dest="domain_list",
+                    help="域名列表（等同位置参数，便于 --xxx 与 -d 混用）")
     ap.add_argument("-o", "--out", help="输出目录（默认 output/）")
     ap.add_argument("-w", "--workers", type=int, default=6, help="并发数，默认 6")
     ap.add_argument("--limit", type=int, help="最多处理多少个域名")
@@ -554,6 +584,8 @@ def main():
     ap.add_argument("--subdomain", action="store_true", help="启用子域枚举")
     ap.add_argument("--multi-node", action="store_true", help="启用多节点 CDN 探测")
 
+    ap.add_argument("--vt", action="store_true",
+                    help="启用载荷分析（下载样本 → 查/传 VT）")
     ap.add_argument("--no-payload", action="store_true", help="跳过载荷分析")
     ap.add_argument("--no-upload", action="store_true", help="VT 无记录时不自动上传")
     ap.add_argument("--no-mail", action="store_true", help="不生成举报邮件")
@@ -561,10 +593,12 @@ def main():
     ap.add_argument("--interval", type=int, default=25, help="邮件发送间隔秒")
 
     args = ap.parse_args()
-    if not (args.domains or args.d):
+    src_arg = args.domains or args.domain_list
+    if not src_arg:
         banner()
         ap.print_help()
         return 1
+    args.domains = src_arg
 
     try:
         return run(args)

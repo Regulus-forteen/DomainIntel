@@ -28,8 +28,8 @@
       ],
       "aliases": [
         "deepseek",
-        "deepseek-v3",
-        "deepseek-r1"
+        "deepseek-v4",
+        "DSH"
       ]
     },
     {
@@ -44,7 +44,7 @@
     {
       "name": "网易UU",
       "official": [
-        "uu.163.com"
+        "uuyc.163.com","uuyc.com"
       ],
       "aliases": [
         "uu",
@@ -71,9 +71,9 @@
       ]
     },
     {
-      "name": "通义千问",
+      "name": "千问",
       "official": [
-        "tongyi.aliyun.com"
+        "www.qianwen.com"
       ],
       "aliases": [
         "qianwen",

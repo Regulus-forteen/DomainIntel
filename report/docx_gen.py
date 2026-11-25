@@ -479,15 +479,39 @@ def build_docx(results, stats, out_path, title="域名情报采集报告"):
                 C.append(_T(["编号", "文件", "大小", "类型", "VT 检测"], prow))
                 for j, x in enumerate(pa[:4], 1):
                     v = x.get("vt") or {}
-                    if v.get("label"):
-                        C.append(_P("载荷 %d 威胁类型：%s" % (j, v["label"]),
-                                    font="宋体", size=9))
+                    st2 = v.get("stats") or {}
+
+                    detail = []
                     if x.get("sha256"):
-                        C.append(_P("载荷 %d SHA256：%s" % (j, x["sha256"]),
-                                    font="Consolas", size=8))
-                    for e in (v.get("engines") or [])[:6]:
-                        C.append(_P("　%s: %s" % (e["engine"], e["result"][:44]),
-                                    font="Consolas", size=8))
+                        detail.append("SHA256：%s" % x["sha256"])
+                    detail.append("状态：%s" % ("已上传分析" if x.get("uploaded")
+                                              else ("VT 库中已有" if v.get("found")
+                                                    else "未分析")))
+                    if v.get("found"):
+                        detail.append("检测结果：%d/%d 引擎报毒"
+                                      % (st2.get("malicious", 0),
+                                         st2.get("total", 0)))
+                        if v.get("label"):
+                            detail.append("威胁类型：%s" % v["label"])
+                        if v.get("link"):
+                            detail.append("VT 链接：%s" % v["link"])
+                    elif v.get("error"):
+                        detail.append("检测失败：%s" % v["error"][:60])
+
+                    for line in detail:
+                        C.append(_P("载荷 %d %s" % (j, line),
+                                    font="宋体", size=9))
+
+                    engines = v.get("engines") or []
+                    if engines:
+                        C.append(_P("载荷 %d 报毒引擎（共 %d 个）："
+                                    % (j, len(engines)), font="宋体", size=9))
+                        for e in engines[:12]:
+                            C.append(_P("　%s: %s" % (e["engine"], e["result"][:48]),
+                                        font="Consolas", size=8))
+                        if len(engines) > 12:
+                            C.append(_P("　…（仅列前 12 个）",
+                                        font="楷体", size=8, color="666666"))
 
             if cert.get("subject"):
                 C.append(_P("TLS 证书", font="黑体", size=10, bold=True))

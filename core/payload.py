@@ -65,16 +65,23 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
             res = vt.get_analysis(up["analysis_id"], wait=wait_analysis)
             if res.get("ok") and res.get("completed"):
                 stats = res.get("stats") or {}
+                total = (stats.get("malicious", 0) + stats.get("suspicious", 0)
+                         + stats.get("undetected", 0) + stats.get("harmless", 0)
+                         + stats.get("timeout", 0))
                 out["vt"] = {
-                    "hash": sha, "found": True,
+                    "hash": sha,
+                    "found": True,
                     "from_analysis": True,
+                    "label": res.get("label") or "",
+                    "engines": res.get("engines") or [],
                     "stats": {
                         "malicious": stats.get("malicious", 0),
                         "suspicious": stats.get("suspicious", 0),
                         "undetected": stats.get("undetected", 0),
                         "harmless": stats.get("harmless", 0),
                         "timeout": stats.get("timeout", 0),
-                        "total": sum(stats.values()) if stats else 0,
+                        "total": total or sum(v for k, v in stats.items()
+                                              if isinstance(v, int)),
                     },
                     "link": "https://www.virustotal.com/gui/file/%s" % sha,
                 }
