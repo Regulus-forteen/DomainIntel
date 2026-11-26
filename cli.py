@@ -19,6 +19,31 @@ from collections import Counter, defaultdict
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
+
+def _ensure_venv():
+    """
+    用系统 python 直接跑 cli.py 时依赖不全（dns/requests 等装在 .venv 里）。
+    这里检测到不在 venv 且 .venv 存在，就用 .venv 的解释器重新执行自己。
+    """
+    venv_py = BASE_DIR / ".venv" / "Scripts" / "python.exe"
+    if not venv_py.exists():
+        return
+    try:
+        cur = Path(sys.executable).resolve()
+        tgt = venv_py.resolve()
+    except Exception:
+        return
+    if cur == tgt:
+        return
+    # 防止递归
+    if os.environ.get("_DI_VENV_ACTIVE") == "1":
+        return
+    os.environ["_DI_VENV_ACTIVE"] = "1"
+    os.execv(str(tgt), [str(tgt), str(Path(__file__).resolve())] + sys.argv[1:])
+
+
+_ensure_venv()
+
 if os.name == "nt":
     try:
         import ctypes
