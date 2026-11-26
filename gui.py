@@ -374,10 +374,11 @@ class App(tk.Tk):
         self.v_sub = tk.BooleanVar(value=False)
         self.v_mnode = tk.BooleanVar(value=False)
         self.v_vt = tk.BooleanVar(value=False)
+        self.v_dyn = tk.BooleanVar(value=False)
         for txt, var in [("权威验证", self.v_auth), ("多轮DNS", self.v_multi),
                          ("TLS证书", self.v_cert), ("端口扫描", self.v_port),
                          ("同IP反查", self.v_revip), ("子域枚举", self.v_sub),
-                         ("多节点", self.v_mnode), ("VT分析", self.v_vt)]:
+                         ("多节点", self.v_mnode), ("VT分析", self.v_vt), ("动态解析", self.v_dyn)]:
             ttk.Checkbutton(fb, text=txt, variable=var).pack(side="left", padx=(0, 8))
         ttk.Label(fb, text="并发").pack(side="left", padx=(8, 2))
         self.v_workers = tk.IntVar(value=5)
@@ -799,8 +800,26 @@ class App(tk.Tk):
             "subdomain": self.v_sub.get(),
             "multi_node": self.v_mnode.get(),
             "vt_analysis": self.v_vt.get(),
+            "dynamic": self.v_dyn.get(),
         }
         self._vt_options = dict(options)
+
+        # 勾了动态解析但没装 playwright → 提示
+        if options.get("dynamic"):
+            try:
+                from core import dynamic as _dyn
+                ok, err = _dyn.is_available()
+                if not ok:
+                    messagebox.showwarning(
+                        "动态解析不可用",
+                        "需要安装 Playwright + Chromium：\n\n"
+                        "  pip install playwright\n"
+                        "  playwright install chromium\n\n"
+                        "安装后重启本工具。\n本次将跳过动态解析。")
+                    options["dynamic"] = False
+                    self.v_dyn.set(False)
+            except Exception:
+                pass
         threading.Thread(target=self._worker,
                          args=(domains, options, self.v_workers.get()),
                          daemon=True).start()

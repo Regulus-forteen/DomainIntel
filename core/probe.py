@@ -79,6 +79,10 @@ def probe(domain, options=None):
         if opt["cert"]:
             r["cert"] = httpx.cert_probe(domain)
 
+        # 动态解析（可选）：静态没拿到载荷时用浏览器点击
+        if opt.get("dynamic") and not (r.get("http_best") or {}).get("download_links"):
+            r["dynamic"] = _run_dynamic(domain, r.get("http_best") or {})
+
         # 6. IP 情报
         r["ip_infos"] = []
         for ip in ips[:3]:
@@ -95,6 +99,13 @@ def probe(domain, options=None):
     # 7. 子域枚举
     if opt["subdomain"]:
         r["subdomains"] = dnsx.subdomain_probe(domain)
+
+    # 7.5 分发节点探测：外部 JS 域名 / 官方域变体 → 探测其子域
+    try:
+        r["dist_nodes"] = _probe_dist_nodes(domain, r.get("http_best") or {})
+    except Exception as e:
+        r["dist_nodes"] = {"error": str(e)[:80]}
+
 
     # 8. 风险评分（v2）
     r["risk"] = scoring.score_v2(r)
@@ -217,3 +228,148 @@ def _mark_relations(results):
                 s = risk["score"]
                 risk["level"] = ("高危" if s >= 70 else "可疑" if s >= 45
                                  else "低危" if s >= 20 else "正常")
+
+def _run_dynamic(domain, http_best):
+    """
+    调 Playwright 解析 JS 驱动的下载地址，并把结果合并回 http_best
+    """
+    try:
+        from . import dynamic as dyn
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:100]}
+
+    ok, err = dyn.is_available()
+    if not ok:
+        return {"ok": False, "error": err}
+
+    page_url = http_best.get("final_url") or ("https://%s/" % domain)
+    res = dyn.resolve(page_url, timeout=30000, max_clicks=6)
+
+    # 合并到 http_best
+    if res.get("payloads"):
+        cur_strong = set(http_best.get("payload_strong") or [])
+        cur_weak = set(http_best.get("payload_weak") or [])
+        from urllib.parse import urlparse as _up
+
+        def _root(h):
+            h = (h or "").lower().split(":")[0]
+            parts = h.split(".")
+            for s in (".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn"):
+                if h.endswith(s):
+                    return ".".join(parts[-3:])
+            return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+        cur_root = _root(_up(page_url).netloc)
+        for u in res["payloads"]:
+            try:
+                pr = _root(_up(u).netloc)
+            except Exception:
+                continue
+            if pr != cur_root:
+                cur_strong.add(u)
+            else:
+                cur_weak.add(u)
+
+        http_best["payload_strong"] = sorted(cur_strong)[:20]
+        http_best["payload_weak"] = sorted(cur_weak)[:20]
+        http_best["download_links"] = sorted(cur_strong | cur_weak)[:20]
+        http_best["dynamic_found"] = True
+
+    http_best["dynamic_requests"] = res.get("requests") or []
+    http_best["dynamic_downloads"] = res.get("downloads") or []
+    return res
+
+def _probe_dist_nodes(domain, http_best):
+    """
+    从页面线索里找出候选分发节点，探测常见子域，抓载荷
+    返回 {
+      candidates: [{host, source}],
+      probed: [{host, ips, status, payloads}],
+      payloads: [url...]
+    }
+    """
+    import requests
+    from . import httpx as _hx
+
+    out = {"candidates": [], "probed": [], "payloads": []}
+
+    # 候选来源1：页面引用的外部 JS 域名
+    for h in (http_best.get("external_js") or []):
+        out["candidates"].append({"host": h, "source": "外部JS"})
+    # 来源2：官方域变体
+    for x in (http_best.get("official_variants") or []):
+        out["candidates"].append({"host": x.get("host"), "source": "官方域变体"})
+
+    # 去重，排除已处理过的域名
+    seen = {domain}
+    cands = []
+    for c in out["candidates"]:
+        h = (c.get("host") or "").lower()
+        if not h or h in seen:
+            continue
+        seen.add(h)
+        cands.append(c)
+    out["candidates"] = cands[:6]
+
+    if not cands:
+        return out
+
+    # 对每个候选域，先解析主域，再试探常见子域
+    import dns.resolver
+    SUBS = ["1", "2", "1019web", "web", "www", "dl", "down", "app", "cdn", "static"]
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    for c in cands:
+        base = c["host"]
+        # 去掉公共后缀得到主域
+        parts = base.split(".")
+        if len(parts) >= 3 and parts[-2] in ("com", "net", "org", "gov", "edu")                 and parts[-1] == "cn":
+            root = ".".join(parts[-3:])
+        else:
+            root = ".".join(parts[-2:]) if len(parts) >= 2 else base
+
+        test_hosts = [root]
+        for s in SUBS:
+            test_hosts.append("%s.%s" % (s, root))
+
+        for th in test_hosts[:8]:
+            if th in seen:
+                continue
+            seen.add(th)
+            try:
+                ans = dns.resolver.resolve(th, "A", lifetime=4)
+                ips = sorted({x.address for x in ans})
+            except Exception:
+                continue
+
+            item = {"host": th, "ips": ips, "status": None, "payloads": []}
+            # 有解析就试着抓页面
+            try:
+                url = "http://%s/" % th
+                r = requests.get(url, headers={"User-Agent": UA}, timeout=10,
+                                 verify=False, allow_redirects=True)
+                item["status"] = r.status_code
+                if r.status_code < 400 and len(r.text) > 200:
+                    sub = _hx.analyze_links(r.text, url)
+                    pays = (sub.get("payload_strong") or []) + \
+                           (sub.get("object_storage") or [])
+                    if pays:
+                        item["payloads"] = sorted(set(pays))[:5]
+                        for x in item["payloads"]:
+                            if x not in out["payloads"]:
+                                out["payloads"].append(x)
+            except Exception:
+                pass
+
+            out["probed"].append(item)
+
+    # 把抓到的载荷合并进 http_best
+    if out["payloads"]:
+        cur = set(http_best.get("payload_strong") or [])
+        cur |= set(out["payloads"])
+        http_best["payload_strong"] = sorted(cur)[:20]
+        http_best["download_links"] = sorted(
+            set(http_best.get("download_links") or []) | cur)[:20]
+
+    return out

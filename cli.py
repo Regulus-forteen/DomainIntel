@@ -280,6 +280,8 @@ def run(args):
         "reverse_ip": args.reverse_ip,
         "subdomain": args.subdomain,
         "multi_node": args.multi_node,
+        "dynamic": args.dynamic,
+        "vt_analysis": args.vt,
     }
 
     # ============ 阶段 1：探测 ============
@@ -583,6 +585,8 @@ def main():
     ap.add_argument("--reverse-ip", action="store_true", help="启用同 IP 反查")
     ap.add_argument("--subdomain", action="store_true", help="启用子域枚举")
     ap.add_argument("--multi-node", action="store_true", help="启用多节点 CDN 探测")
+    ap.add_argument("--dynamic", action="store_true",
+                    help="启用动态解析（Playwright 点击按钮抓 JS 生成的下载地址）")
 
     ap.add_argument("--vt", action="store_true",
                     help="启用载荷分析（下载样本 → 查/传 VT）")

@@ -98,6 +98,37 @@ def _looks_random(label):
     return False
 
 
+def _official_variant(host, brand_officials):
+    """
+    判断 host 是否是某品牌官方域名的变体（加前后缀）。
+    例：oray.com → cdn-oray.com / oray-cdn.com
+        deepseek.com → cdns-deepseek.com / deepseek-cdn.com
+    返回命中的品牌名，未命中返回 None
+    """
+    h = (host or "").lower().split(":")[0]
+    labels = h.split(".")
+    if len(labels) < 2:
+        return None
+    main = labels[-2]           # 主标签，如 cdn-oray
+    for brand, officials in brand_officials.items():
+        for off in officials:
+            off_label = off.lower().split(".")[0]
+            if len(off_label) < 3:
+                continue
+            # 完全相同不算变体（那是官方本身）
+            if main == off_label:
+                continue
+            # 主标签包含官方标签 + 有额外前后缀
+            if off_label in main and len(main) > len(off_label):
+                return brand
+    return None
+
+
+def _is_object_host(host):
+    h = (host or "").lower()
+    return any(k in h for k in CDN_OBJECT_HOSTS)
+
+
 def _risky_domain(host):
     """判断是否高风险域名：高风险 TLD + 随机串主体"""
     h = (host or "").lower().split(":")[0]
@@ -128,6 +159,17 @@ NETDISK_PATTERNS = [
 ]
 
 # 跳转网关特征（域名里带这些 + go.php / jump / tj）
+# 对象存储 / CDN 分发平台（载荷常托管在这类免费或低门槛服务上）
+CDN_OBJECT_HOSTS = (
+    "r2.dev", "r2.cloudflarestorage.com",
+    "oss-cn-", "oss-accelerate", "oss-ap-",
+    "tos-cn-", "cos.ap-", "cos.na-", "myqcloud.com",
+    "kodo", "qiniucdn", "bkt.clouddn.com",
+    "blob.core.windows.net", "s3.amazonaws.com",
+    "storage.googleapis.com", "digitaloceanspaces.com",
+    "backblazeb2.com", "b2cdn.com",
+)
+
 PUBLIC_PLATFORM_HOSTS = {
     "github.com", "www.github.com", "gitlab.com", "gitee.com",
     "opensource.org", "www.opensource.org",
@@ -207,9 +249,16 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
         info["len_header"] = int(clen) if clen and clen.isdigit() else None
 
         raw = b""
+        title_seen_at = None
         for chunk in r.iter_content(8192):
+            if not chunk:
+                continue
             raw += chunk
-            if len(raw) > 30000 and b"</title>" in raw.lower():
+            # 记录首次出现 </title> 的位置；之后继续多读至少 300KB，
+            # 因为下载按钮/表单/脚本常出现在标题之后很远
+            if title_seen_at is None and b"</title>" in raw.lower():
+                title_seen_at = len(raw)
+            if title_seen_at is not None and len(raw) - title_seen_at > 300000:
                 break
             if len(raw) >= maxbytes:
                 break
@@ -612,76 +661,65 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
         except Exception:
             pass
 
-        # ---------- 二层：抓下载页，合并所有发现 ----------
-        if not info["payload_strong"] and download_pages[:3]:
-            merged_nd = list(info.get("netdisks") or [])
-            merged_gw = list(info.get("gateways") or [])
-            merged_ps = []
-            merged_pw = []
+        # ---------- 二层：抓下载页，复用完整分析逻辑 ----------
+        def _merge_dict(src_dict):
+            for k in ("payload_strong", "payload_weak", "ld_downloads",
+                      "js_map_hits", "serverless_payload", "suspicious_hosts",
+                      "download_pages"):
+                for x in (src_dict.get(k) or []):
+                    if x not in info.get(k, []):
+                        info.setdefault(k, []).append(x)
+            for x in (src_dict.get("netdisks") or []):
+                if not any(y["url"] == x["url"] for y in info.get("netdisks", [])):
+                    info.setdefault("netdisks", []).append(x)
+            for x in (src_dict.get("gateways") or []):
+                if not any(y["url"] == x["url"] for y in info.get("gateways", [])):
+                    info.setdefault("gateways", []).append(x)
+            for w in (src_dict.get("lure_words") or []):
+                if w not in info.get("lure_words", []):
+                    info.setdefault("lure_words", []).append(w)
 
-            for dp in download_pages[:3]:
+        depth1_pages = list(dict.fromkeys(
+            (info.get("download_pages") or [])[:3]))
+        depth2_pages = []
+
+        if depth1_pages:
+            for dp in depth1_pages:
                 try:
                     r2 = requests.get(dp, headers={"User-Agent": UA, "Referer": url},
-                                      timeout=10, verify=False)
+                                      timeout=12, verify=False)
                     if r2.status_code >= 400:
                         continue
                     t2 = r2.text
-
-                    # 复用同一套识别逻辑
-                    nd2, gw2 = _collect_netdisk_gateway(t2)
-                    for x in nd2:
-                        if not any(y["url"] == x["url"] for y in merged_nd):
-                            merged_nd.append(x)
-                    for x in gw2:
-                        if not any(y["url"] == x["url"] for y in merged_gw):
-                            merged_gw.append(x)
-
-                    # 直链可执行
-                    for m in re.finditer(
-                            r'https?://[^\s"\'<>()\\]+?\.' + BINARY_EXT, t2, re.I):
-                        u2 = m.group(0)
-                        try:
-                            ext = (_root_of(_up(u2).netloc) != cur_root)
-                        except Exception:
-                            ext = False
-                        (merged_ps if ext else merged_pw).append(u2)
-
-                    # href 相对路径可执行
-                    for m in re.finditer(
-                            r'["\']([^"\']{3,200}?\.' + BINARY_EXT + r')["\']', t2, re.I):
-                        u2 = _abs(m.group(1))
-                        if u2:
-                            merged_pw.append(u2)
-
+                    sub = analyze_links(t2, dp)
+                    _merge_dict(sub)
+                    # 收集下一层候选
+                    for p2 in (sub.get("download_pages") or [])[:2]:
+                        if p2 not in depth1_pages and p2 not in depth2_pages:
+                            depth2_pages.append(p2)
                 except Exception:
                     pass
 
-            if merged_ps:
-                info["payload_strong"] = sorted(set(merged_ps))[:15]
-            if merged_pw:
-                info["payload_weak"] = sorted(set(merged_pw + (info.get("payload_weak") or [])))[:15]
-            info["payload_deep"] = sorted(set(merged_ps))[:15]
-            if merged_ps:
-                info["download_links"] = info["payload_strong"]
-            elif merged_pw:
-                info["download_links"] = info["payload_weak"]
+        # 递归一层：如果还是没拿到载荷，再抓一层
+        if not info.get("payload_strong") and depth2_pages:
+            for dp in depth2_pages[:2]:
+                try:
+                    r3 = requests.get(dp, headers={"User-Agent": UA, "Referer": url},
+                                      timeout=12, verify=False)
+                    if r3.status_code >= 400:
+                        continue
+                    _merge_dict(analyze_links(r3.text, dp))
+                except Exception:
+                    pass
 
-            # 网盘 / 网关合并
-            seen = set()
-            n3 = []
-            for n in merged_nd:
-                if n["url"] not in seen:
-                    seen.add(n["url"])
-                    n3.append(n)
-            info["netdisks"] = n3[:15]
-
-            seen = set()
-            g3 = []
-            for g in merged_gw:
-                if g["url"] not in seen:
-                    seen.add(g["url"])
-                    g3.append(g)
-            info["gateways"] = g3[:10]
+        # 去重收尾
+        for k in ("payload_strong", "payload_weak", "ld_downloads", "js_map_hits",
+                  "serverless_payload", "suspicious_hosts"):
+            info[k] = sorted(set(info.get(k) or []))[:20]
+        info["download_pages"] = sorted(set(info.get("download_pages") or []))[:10]
+        info["download_links"] = sorted(
+            set(info.get("payload_strong") or []) | set(info.get("payload_weak") or []))[:20]
+        info["payload_deep"] = info["payload_strong"][:15]
 
         info["buckets"] = sorted({
             re.sub(r"^https?://", "", l).split("/")[0]
@@ -697,6 +735,21 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
 
         info["body_head"] = re.sub(r"\s+", " ", txt)[:600]
         info.update(_extract_favicon(txt, url))
+
+        # 统一分析（对象存储/官方变体/外部JS）
+        try:
+            sub = analyze_links(txt, url)
+            for k in ("object_storage", "official_variants", "external_js_domains"):
+                if sub.get(k):
+                    info[k] = sub[k]
+            for u in (sub.get("object_storage") or []):
+                if u not in (info.get("payload_strong") or []):
+                    info.setdefault("payload_strong", []).append(u)
+            for d in (sub.get("external_js_domains") or []):
+                if d not in (info.get("external_js") or []):
+                    info.setdefault("external_js", []).append(d)
+        except Exception:
+            pass
         info["html"] = txt[:maxbytes]
 
     except requests.exceptions.SSLError as e:
@@ -808,3 +861,275 @@ def collect_http(domain):
             best = v
             break
     return out, best
+
+def analyze_links(html, base_url):
+    """
+    独立分析一段 HTML 里的载荷线索。
+    供主页面与二层抓取共用，返回 dict：
+      {payload_strong, payload_weak, netdisks, gateways, download_pages,
+       ld_downloads, data_hints, js_map_hits, serverless_payload,
+       suspicious_hosts, lure_words}
+    """
+    from urllib.parse import urlparse as _up, unquote as _unq
+    import base64 as _b64
+
+    out = {
+        "payload_strong": [], "payload_weak": [], "netdisks": [],
+        "gateways": [], "download_pages": [], "ld_downloads": [],
+        "data_hints": [], "js_map_hits": [], "serverless_payload": [],
+        "suspicious_hosts": [], "lure_words": [],
+        "object_storage": [],       # r2.dev / OSS / TOS 等对象存储直链
+        "official_variants": [],    # cdn-oray.com 这类官方域变体
+        "external_js_domains": [],  # 页面引用的外部 JS 所在域名
+    }
+    txt = html or ""
+    if not txt:
+        return out
+
+    def _root_of(host):
+        h = (host or "").lower().split(":")[0]
+        parts = h.split(".")
+        for suf in (".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn"):
+            if h.endswith(suf):
+                return ".".join(parts[-3:])
+        return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+    def _abs(h):
+        if not h or h.startswith("#") or h.lower().startswith("javascript:"):
+            return None
+        if h.startswith("//"):
+            return "https:" + h
+        if not h.startswith("http"):
+            return urljoin(base_url, h)
+        return h
+
+    def _is_bin(u):
+        try:
+            path = _up(u).path.lower()
+        except Exception:
+            return False
+        return bool(re.search(r"\." + BINARY_EXT + r"$", path, re.I))
+
+    def _netdisk(u):
+        for pat, name in NETDISK_PATTERNS:
+            if re.search(pat, u, re.I):
+                return name
+        return None
+
+    def _try_b64(s):
+        s = _unq(s)
+        for pad in ("", "=", "=="):
+            try:
+                raw = _b64.b64decode(s + pad, validate=False)
+                t = raw.decode("utf-8", "ignore")
+                if t.startswith("http"):
+                    return t
+            except Exception:
+                continue
+        return None
+
+    def _decode_gateway(u):
+        try:
+            q = _up(u).query
+            for k in ("u", "url", "target", "to", "link", "redirect"):
+                m = re.search(r"(?:^|&)" + k + r"=([^&]+)", q)
+                if m:
+                    d = _try_b64(m.group(1))
+                    if d:
+                        return d
+        except Exception:
+            pass
+        return None
+
+    cur_root = _root_of(_up(base_url).netloc.lower())
+
+    def _push(u):
+        if not u:
+            return
+        u = u.strip()
+        try:
+            host = _up(u).netloc.lower()
+        except Exception:
+            return
+        ext = (_root_of(host) != cur_root)
+
+        nd = _netdisk(u)
+        if nd:
+            out["netdisks"].append({"url": u, "netdisk": nd})
+            return
+
+        low = u.lower()
+        if any(h in low for h in GATEWAY_HINTS) or re.search(r"[?&](u|url|target)=", low):
+            tg = _decode_gateway(u)
+            out["gateways"].append({"url": u, "target": tg})
+            if tg:
+                nd2 = _netdisk(tg)
+                if nd2:
+                    out["netdisks"].append({"url": tg, "netdisk": nd2, "via": u})
+            return
+
+        if _is_bin(u):
+            (out["payload_strong"] if ext else out["payload_weak"]).append(u)
+            return
+
+        if ext:
+            return
+        if re.search(r"download|/dl/|xiazai|setup|install|下载", low):
+            out["download_pages"].append(u)
+
+    # a 标签
+    for m in re.finditer(r'<a\b[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>',
+                         txt, re.I):
+        u = _abs(m.group(1))
+        if u:
+            _push(u)
+
+    # 全文绝对 URL（兜底）
+    for m in re.finditer(r'https?://[^\s"\'<>()\\]+', txt):
+        _push(m.group(0))
+
+    # Schema.org
+    for m in re.finditer(
+            r'<script[^>]+type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            txt, re.I | re.S):
+        body = m.group(1)
+        for dm in re.finditer(r'"(?:downloadUrl|contentUrl|fileUrl|installUrl)"\s*:\s*"([^"]+)"',
+                              body, re.I):
+            u = dm.group(1).replace("\\/", "/")
+            out["ld_downloads"].append(u)
+            u2 = _abs(u)
+            if u2:
+                try:
+                    host = _up(u2).netloc.lower()
+                    if any(h in host for h in SERVERLESS_HOSTS):
+                        out["serverless_payload"].append(u2)
+                    if _root_of(host) != cur_root:
+                        out["payload_strong"].append(u2)
+                    else:
+                        out["payload_weak"].append(u2)
+                except Exception:
+                    pass
+
+    # data-*
+    for m in re.finditer(
+            r'data-(?:dl|file|url|href|src|link|download|pkg|app)\s*=\s*["\']([^"\']{1,120})["\']',
+            txt, re.I):
+        v = m.group(1).strip()
+        if v and v not in out["data_hints"]:
+            out["data_hints"].append(v)
+
+    # JS 映射表
+    for m in re.finditer(
+            r'["\']([a-z0-9_\-]{3,40})["\']\s*:\s*["\'](https?://[^"\']{6,300}?)["\']',
+            txt, re.I):
+        val = m.group(2).replace("\\/", "/")
+        if re.search(r"\.(?:%s)" % BINARY_EXT, val, re.I) or \
+                any(h in val.lower() for h in SERVERLESS_HOSTS):
+            out["js_map_hits"].append(val)
+    for hint in out["data_hints"]:
+        for m in re.finditer(
+                r'["\']%s["\']\s*:\s*["\'](https?://[^"\']{6,300}?)["\']'
+                % re.escape(hint), txt, re.I):
+            u = m.group(1).replace("\\/", "/")
+            out["js_map_hits"].append(u)
+            u2 = _abs(u)
+            if u2:
+                out["payload_strong"].append(u2)
+
+    # onclick / triggerDownload
+    for m in re.finditer(
+            r"""on(?:click|mousedown)\s*=\s*["']([^"']{3,400}?)["']""", txt, re.I):
+        for mm in re.finditer(
+                r"""["']([^"']*\.(?:""" + BINARY_EXT + r"""))["']""", m.group(1), re.I):
+            u = _abs(mm.group(1))
+            if u:
+                out["payload_weak"].append(u)
+    for m in re.finditer(
+            r"""(?:triggerDownload|downloadFile|startDownload)\(\s*(?:this\s*,\s*)?["']([^"']{3,300}?)["']""",
+            txt, re.I):
+        u = _abs(m.group(1))
+        if u and re.search(r"\.(?:%s)" % BINARY_EXT, u, re.I):
+            out["payload_weak"].append(u)
+
+    # 诱导文案
+    LURE = ["立即下载", "马上安装", "点击下载", "免费下载", "高速下载",
+            "电脑版下载", "客户端下载", "下载安装", "一键下载", "本地下载",
+            "download now", "install now", "free download"]
+    out["lure_words"] = [w for w in LURE if w in txt]
+
+    # 可疑域名
+    try:
+        for hh in set(re.findall(r"https?://([a-z0-9\.\-]+)", txt, re.I)):
+            hh = hh.lower().split(":")[0]
+            if _root_of(hh) == cur_root:
+                continue
+            if _risky_domain(hh):
+                out["suspicious_hosts"].append(hh)
+    except Exception:
+        pass
+
+    # ---------- 对象存储 / CDN 直链 ----------
+    all_urls = set(re.findall(r"https?://[^\s\"'<>()\\]+", txt))
+    for u in all_urls:
+        try:
+            hh = _up(u).netloc.lower()
+        except Exception:
+            continue
+        if _is_object_host(hh):
+            if re.search(r"\.(?:exe|zip|rar|7z|msi|apk|dmg|pkg)", u, re.I):
+                out["object_storage"].append(u)
+                out["payload_strong"].append(u)
+
+    # ---------- 官方域名变体 ----------
+    try:
+        import json as _json
+        _bf = Path(__file__).resolve().parent / "brands.json"
+        _bd = _json.loads(_bf.read_text(encoding="utf-8"))
+        officials = {}
+        for b in _bd.get("brands", []):
+            offs = [o.split("/")[0] for o in b.get("official", [])]
+            if offs:
+                officials[b.get("name", "")] = offs
+        for hh in set(re.findall(r"https?://([a-z0-9\.\-]+)", txt, re.I)):
+            hh = hh.lower().split(":")[0]
+            brand = _official_variant(hh, officials)
+            if brand:
+                out["official_variants"].append({"host": hh, "brand": brand})
+    except Exception:
+        pass
+
+    # ---------- 外部 JS 域名（head.js 型分发）----------
+    for m in re.finditer(r'<script[^>]+src\s*=\s*["\']([^"\']+)["\']', txt, re.I):
+        u = _abs(m.group(1))
+        if not u:
+            continue
+        try:
+            hh = _up(u).netloc.lower()
+        except Exception:
+            continue
+        if _root_of(hh) != cur_root:
+            out["external_js_domains"].append(hh)
+            # 外部 JS 本身也作为候选下载站记录
+            out["download_pages"].append(u)
+
+    out["object_storage"] = sorted(set(out["object_storage"]))[:10]
+    out["external_js_domains"] = sorted(set(out["external_js_domains"]))[:10]
+    _seen_ov = set()
+    _ov = []
+    for x in out["official_variants"]:
+        if x["host"] not in _seen_ov:
+            _seen_ov.add(x["host"])
+            _ov.append(x)
+    out["official_variants"] = _ov[:10]
+
+    for k in ("payload_strong", "payload_weak", "download_pages", "ld_downloads",
+              "js_map_hits", "serverless_payload", "suspicious_hosts", "data_hints"):
+        out[k] = sorted(set(out[k]))[:20]
+    out["data_hints"] = out["data_hints"][:15]
+    seen = set()
+    out["netdisks"] = [x for x in out["netdisks"]
+                       if not (x["url"] in seen or seen.add(x["url"]))][:15]
+    seen = set()
+    out["gateways"] = [x for x in out["gateways"]
+                       if not (x["url"] in seen or seen.add(x["url"]))][:10]
+    return out
