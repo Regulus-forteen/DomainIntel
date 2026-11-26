@@ -279,6 +279,24 @@ def _run_dynamic(domain, http_best):
     http_best["dynamic_downloads"] = res.get("downloads") or []
     return res
 
+# 公共统计 / 公共服务 / 知名 CDN，不当作攻击者的分发节点
+NOISE_HOSTS = (
+    "51.la", "cnzz.com", "umeng.com", "baidu.com", "google-analytics.com",
+    "googletagmanager.com", "gtag", "hm.baidu.com", "clarity.ms",
+    "doubleclick.net", "facebook.net", "twitter.com", "jquery.com",
+    "bootcdn.net", "jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
+    "staticfile.org", "fontawesome.com", "googleapis.com", "gstatic.com",
+    "cloudflare.com", "cloudflareinsights.com", "51yes.com", "51tui.com",
+    "w3.org", "schema.org", "mozilla.org", "wordpress.org", "wp.com",
+    "qq.com", "weixin.qq.com", "gtimg.cn", "bdstatic.com",
+)
+
+
+def _is_noise(host):
+    h = (host or "").lower()
+    return any(k in h for k in NOISE_HOSTS)
+
+
 def _probe_dist_nodes(domain, http_best):
     """
     从页面线索里找出候选分发节点，探测常见子域，抓载荷
@@ -307,6 +325,8 @@ def _probe_dist_nodes(domain, http_best):
         h = (c.get("host") or "").lower()
         if not h or h in seen:
             continue
+        if _is_noise(h):
+            continue
         seen.add(h)
         cands.append(c)
     out["candidates"] = cands[:6]
@@ -334,7 +354,7 @@ def _probe_dist_nodes(domain, http_best):
             test_hosts.append("%s.%s" % (s, root))
 
         for th in test_hosts[:8]:
-            if th in seen:
+            if th in seen or _is_noise(th):
                 continue
             seen.add(th)
             try:

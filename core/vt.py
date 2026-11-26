@@ -205,97 +205,72 @@ def upload_file(path, timeout=300):
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:100])}
 
 
-def get_analysis(analysis_id, wait=300, interval=15):
+def get_analysis(analysis_id, wait=300, interval=15, progress_cb=None):
     """
-    轮询分析结果，最多等 wait 秒
-    返回 {ok, completed, stats, engines, label, categories, sha256, error}
+    轮询分析结果
+    progress_cb(elapsed, total, pct, text, stats) 每轮回调
     """
-    deadline = time.time() + wait
-    last_err = None
-    while time.time() < deadline:
-        _limiter.wait()
+    import time as _t
+
+    total = max(1, int(wait))
+    start_ts = _t.time()
+    poll = max(5, min(int(interval), 30))
+    last = {}
+
+    while True:
+        elapsed = _t.time() - start_ts
+        pct = min(99, int(elapsed / total * 100))
         try:
-            r = requests.get("%s/analyses/%s" % (VT_BASE, analysis_id),
-                             headers=_headers(), timeout=30, verify=False)
-            if r.status_code == 401:
-                return {"ok": False, "error": "API Key 无效"}
-            if r.status_code == 429:
-                last_err = "触发限流"
-                time.sleep(20)
-                continue
-            if r.status_code != 200:
-                last_err = "HTTP %s" % r.status_code
-                time.sleep(interval)
-                continue
-
-            j = r.json()
-            attr = (j.get("data") or {}).get("attributes") or {}
-            status = attr.get("status")
-
-            if status != "completed":
-                time.sleep(interval)
-                continue
-
-            stats = attr.get("stats") or {}
-            results = attr.get("results") or {}
-
-            # 引擎明细（只留报毒/可疑）
-            engines = []
-            for eng, v in results.items():
-                if not isinstance(v, dict):
-                    continue
-                cat = v.get("category")
-                if cat in ("malicious", "suspicious"):
-                    engines.append({
-                        "engine": v.get("engine_name") or eng,
-                        "result": v.get("result") or "",
-                        "category": cat,
-                    })
-            engines.sort(key=lambda x: (x["category"] != "malicious",
-                                        x["engine"].lower()))
-
-            # 元信息
-            meta = (j.get("data") or {}).get("meta") or {}
-            finfo = meta.get("file_info") or {}
-            sha = finfo.get("sha256") or ""
-            name = finfo.get("display_name") or finfo.get("name") or ""
-
-            # 从报毒结果里推断威胁类型
-            label = ""
-            cats = {}
-            for e in engines[:20]:
-                r_ = (e.get("result") or "").lower()
-                if "trojan" in r_:
-                    cats["trojan"] = cats.get("trojan", 0) + 1
-                elif "backdoor" in r_:
-                    cats["backdoor"] = cats.get("backdoor", 0) + 1
-                elif "ransom" in r_:
-                    cats["ransom"] = cats.get("ransom", 0) + 1
-                elif "miner" in r_ or "coin" in r_:
-                    cats["miner"] = cats.get("miner", 0) + 1
-                elif "worm" in r_:
-                    cats["worm"] = cats.get("worm", 0) + 1
-                elif "adware" in r_:
-                    cats["adware"] = cats.get("adware", 0) + 1
-            if cats:
-                label = max(cats.items(), key=lambda x: x[1])[0]
-
-            return {
-                "ok": True,
-                "completed": True,
-                "stats": stats,
-                "engines": engines,
-                "label": label,
-                "sha256": sha,
-                "filename": name,
-                "error": None,
-            }
-
+            _limiter.wait()
+            resp = requests.get("%s/analyses/%s" % (VT_BASE, analysis_id),
+                                headers=_headers(), timeout=30, verify=False)
+            if resp.status_code != 200:
+                raise RuntimeError("HTTP %s" % resp.status_code)
+            r = resp.json()
         except Exception as e:
-            last_err = "%s: %s" % (type(e).__name__, str(e)[:80])
-            time.sleep(interval)
+            if progress_cb:
+                progress_cb(elapsed, total, pct, "查询出错：%s" % str(e)[:40], last)
+            if elapsed >= total:
+                return {"ok": False, "completed": False,
+                        "error": "查询失败：%s" % str(e)[:60]}
+            _t.sleep(poll)
+            continue
 
-    return {"ok": False, "error": last_err or "分析超时（%d 秒未完成）" % wait}
+        attrs = r.get("data", {}).get("attributes", {}) or {}
+        status = attrs.get("status")
+        stats = attrs.get("stats") or {}
+        last = stats
+
+        if status == "completed":
+            engines = []
+            for name, res in (attrs.get("results") or {}).items():
+                if res.get("category") in ("malicious", "suspicious"):
+                    engines.append({"engine": name,
+                                    "result": (res.get("result") or "")[:60],
+                                    "category": res.get("category")})
+            label = ""
+            for t in (attrs.get("popular_threat_classification") or {}).get(
+                    "popular_threat_name") or []:
+                if t.get("value"):
+                    label = t["value"]
+                    break
+            if progress_cb:
+                progress_cb(elapsed, total, 100, "分析完成", stats)
+            return {"ok": True, "completed": True, "stats": stats,
+                    "engines": engines, "label": label}
+
+        if progress_cb:
+            progress_cb(elapsed, total, pct,
+                        "VT 排队中（已等 %ds / 最多 %ds）" % (int(elapsed), int(total)),
+                        stats)
+
+        if elapsed >= total:
+            return {"ok": True, "completed": False,
+                    "error": "超过 %ds 仍未完成，请稍后手动查询" % int(total),
+                    "stats": stats}
+
+        _t.sleep(poll)
+
 
 
 def quota_stat():

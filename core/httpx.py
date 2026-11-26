@@ -661,6 +661,27 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
         except Exception:
             pass
 
+        # ---------- 常见下载页猜测 ----------
+        COMMON_DL = (
+            "/download/", "/downloads/", "/download.html", "/downloads.html",
+            "/down/", "/download/windows/", "/download/mac/", "/download/pc/",
+            "/dl/", "/release/", "/releases/", "/download-center/",
+            "/xiazai/", "/soft/", "/client/",
+        )
+        guessed = []
+        for cp in COMMON_DL:
+            u = _abs(cp)
+            if u and u not in guessed:
+                guessed.append(u)
+
+        # ---------- 可疑 JS（/Spider/ 之类）抓一次看内容 ----------
+        spider_js = []
+        for m in re.finditer(r'<script[^>]+src\s*=\s*["\']([^"\']*[Ss]pider[^"\']*)["\']',
+                             txt):
+            u = _abs(m.group(1))
+            if u:
+                spider_js.append(u)
+
         # ---------- 二层：抓下载页，复用完整分析逻辑 ----------
         def _merge_dict(src_dict):
             for k in ("payload_strong", "payload_weak", "ld_downloads",
@@ -679,8 +700,18 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
                 if w not in info.get("lure_words", []):
                     info.setdefault("lure_words", []).append(w)
 
+        # 猜出来的候选只取 HEAD 快速筛，避免大量无效请求
+        for g in guessed[:10]:
+            try:
+                hh = requests.head(g, headers={"User-Agent": UA},
+                                   timeout=6, verify=False, allow_redirects=True)
+                if hh.status_code < 400:
+                    info.setdefault("download_pages", []).append(g)
+            except Exception:
+                pass
+
         depth1_pages = list(dict.fromkeys(
-            (info.get("download_pages") or [])[:3]))
+            (info.get("download_pages") or [])[:4]))
         depth2_pages = []
 
         if depth1_pages:
@@ -700,6 +731,20 @@ def http_probe(url, timeout=12, maxbytes=1200000, ua=None, referer=None):
                 except Exception:
                     pass
 
+        # 可疑 JS：抓内容后分析其中的路径
+        for sjs in spider_js[:2]:
+            try:
+                rj = requests.get(sjs, headers={"User-Agent": UA, "Referer": url},
+                                  timeout=10, verify=False)
+                if rj.status_code < 400 and len(rj.text) > 20:
+                    _merge_dict(analyze_links(rj.text, sjs))
+                    info.setdefault("spider_js", []).append(
+                        {"url": sjs, "len": len(rj.text),
+                         "head": re.sub(r"\s+", " ", rj.text)[:300]})
+            except Exception:
+                pass
+
+        # 指纹/目录：/downloads/ 被禁但文件名可能出现在 JS 里，已由 analyze_links 处理
         # 递归一层：如果还是没拿到载荷，再抓一层
         if not info.get("payload_strong") and depth2_pages:
             for dp in depth2_pages[:2]:
@@ -1068,6 +1113,67 @@ def analyze_links(html, base_url):
     except Exception:
         pass
 
+    # ---------- 内联 JS 里的载荷路径 ----------
+    # 场景：按钮 href="#" 由 JS 改写 → link.href='/downloads/xxx.zip'
+    js_pat = re.compile(
+        r"""(?:href|src|location(?:\.href)?|url|downloadUrl|fileUrl|"
+        r"dataUrl|link)\s*[=:]\s*['"]([^'"]{4,300})['"]""", re.I)
+    cand_js = []
+    for m in js_pat.finditer(txt):
+        v = m.group(1).strip()
+        if not v or v in ("#", "/", "javascript:void(0)", "javascript:;"):
+            continue
+        if v.startswith(("data:", "mailto:", "tel:", "#")):
+            continue
+        cand_js.append(v)
+
+    # 通用字符串提取：任何引号里带可执行扩展名的
+    for m in re.finditer(r"""['"]([^'"]{3,300}?\.(?:exe|zip|rar|7z|msi|apk|dmg|pkg|tar\.gz))['"]""",
+                         txt, re.I):
+        cand_js.append(m.group(1))
+
+    # querySelectorAll('[data-xxx-download]') 这种选择器名 → 反查属性值
+    sel_names = set(re.findall(
+        r"querySelectorAll\(\s*['\"]\[([a-z0-9_\-]+)[\]\^]?", txt, re.I))
+    for attr in sel_names:
+        for m in re.finditer(r'%s\s*=\s*["\']([^"\']+)["\']' % re.escape(attr),
+                             txt, re.I):
+            v = m.group(1).strip()
+            if v and not v.startswith(("#", "javascript:")):
+                cand_js.append(v)
+
+    for v in cand_js:
+        u = _abs(v)
+        if not u:
+            continue
+        path = u.split("?")[0].lower()
+        if re.search(r"\.(?:exe|zip|rar|7z|msi|apk|dmg|pkg)$", path):
+            if _root_of(_up(u).netloc.lower()) != cur_root:
+                out["payload_strong"].append(u)
+            else:
+                out["payload_weak"].append(u)
+        elif re.search(r"/download[s]?/|\.(?:php|asp|jsp)$", path) and \
+                not re.search(r"\.(?:css|js|png|jpg|gif|svg|ico)$", path):
+            out["download_pages"].append(u)
+
+    # ---------- data-* 属性里的 URL ----------
+    for m in re.finditer(r'data-[a-z0-9\-]*(?:url|href|link|download|file|src)'
+                         r'\s*=\s*["\']([^"\']{4,300})["\']', txt, re.I):
+        v = m.group(1).strip()
+        if not v or v.startswith(("#", "javascript:", "data:")):
+            continue
+        u = _abs(v)
+        if not u:
+            continue
+        ext = re.search(r"\.(exe|zip|rar|7z|msi|apk|dmg)$", u.split("?")[0], re.I)
+        if ext:
+            if _root_of(_up(u).netloc.lower()) != cur_root:
+                out["payload_strong"].append(u)
+            else:
+                out["payload_weak"].append(u)
+        else:
+            out["download_pages"].append(u)
+
     # ---------- 对象存储 / CDN 直链 ----------
     all_urls = set(re.findall(r"https?://[^\s\"'<>()\\]+", txt))
     for u in all_urls:
@@ -1083,7 +1189,14 @@ def analyze_links(html, base_url):
     # ---------- 官方域名变体 ----------
     try:
         import json as _json
+        from pathlib import Path
         _bf = Path(__file__).resolve().parent / "brands.json"
+        if not _bf.exists():
+            _bf = Path(__file__).resolve().parent.parent / "core" / "brands.json"
+        if not _bf.exists():
+            _bf = Path(__file__).resolve().parent.parent / "brands.json"
+        if not _bf.exists():
+            raise FileNotFoundError("brands.json")
         _bd = _json.loads(_bf.read_text(encoding="utf-8"))
         officials = {}
         for b in _bd.get("brands", []):
@@ -1096,7 +1209,10 @@ def analyze_links(html, base_url):
             if brand:
                 out["official_variants"].append({"host": hh, "brand": brand})
     except Exception:
-        pass
+        import os as _os
+        if _os.environ.get("DI_DEBUG"):
+            import traceback as _tb
+            _tb.print_exc()
 
     # ---------- 外部 JS 域名（head.js 型分发）----------
     for m in re.finditer(r'<script[^>]+src\s*=\s*["\']([^"\']+)["\']', txt, re.I):

@@ -10,7 +10,8 @@ from . import sample, vt
 
 
 def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
-                    auto_upload=True, wait_analysis=240, progress_cb=None):
+                    auto_upload=True, wait_analysis=240, progress_cb=None,
+                    live_cb=None, vt_progress_cb=None):
     """
     完整分析单个载荷链接
     返回 dict：包含下载信息、哈希、VT 结果
@@ -27,6 +28,9 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
 
     if progress_cb:
         progress_cb("download", url)
+    if live_cb:
+        live_cb({"index": idx, "stage": "下载中", "stage_key": "download",
+                 "file": url.rsplit("/", 1)[-1][:30]})
 
     # 1. 下载
     dl = sample.download(url, idx=idx, max_size=max_size)
@@ -37,6 +41,9 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
         out["error"] = dl.get("error") or "下载失败"
         return out
 
+    if live_cb:
+        live_cb({"index": idx, "stage": "计算哈希", "stage_key": "hash",
+                 "file": out.get("filename") or ""})
     sha = dl["sha256"]
     out["sha256"] = sha
     out["size"] = dl["size"]
@@ -46,6 +53,9 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
     # 2. 查 VT
     if progress_cb:
         progress_cb("vt_query", url)
+    if live_cb:
+        live_cb({"index": idx, "stage": "查询 VirusTotal", "stage_key": "vt_query",
+                 "file": out.get("filename") or ""})
     rep = vt.get_report(sha)
     out["vt"] = rep
 
@@ -56,13 +66,35 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
     if should_upload:
         if progress_cb:
             progress_cb("vt_upload", url)
+        if live_cb:
+            live_cb({"index": idx, "stage": "上传 VirusTotal", "stage_key": "vt_upload",
+                     "file": out.get("filename") or ""})
         up = vt.upload_file(dl["path"])
         if up.get("ok"):
             out["uploaded"] = True
             out["analysis_id"] = up.get("analysis_id")
             if progress_cb:
                 progress_cb("vt_wait", url)
-            res = vt.get_analysis(up["analysis_id"], wait=wait_analysis)
+            if live_cb:
+                live_cb({"index": idx, "stage": "VT 分析中（最多 %ds）" % wait_analysis,
+                         "stage_key": "vt_wait",
+                         "file": out.get("filename") or ""})
+            def _vprog(elapsed, total_w, pct, text, stats):
+                if vt_progress_cb:
+                    vt_progress_cb({
+                        "pct": pct,
+                        "text": text,
+                        "elapsed": int(elapsed),
+                        "total": int(total_w),
+                        "stats": stats or {},
+                    })
+                if live_cb:
+                    live_cb({"index": idx, "stage": text,
+                             "stage_key": "vt_wait",
+                             "file": out.get("filename") or ""})
+
+            res = vt.get_analysis(up["analysis_id"], wait=wait_analysis,
+                                  progress_cb=_vprog)
             if res.get("ok") and res.get("completed"):
                 stats = res.get("stats") or {}
                 total = (stats.get("malicious", 0) + stats.get("suspicious", 0)
@@ -110,7 +142,8 @@ def analyze_payload(url, idx=1, max_size=600 * 1024 * 1024,
     return out
 
 
-def analyze_many(payloads, auto_upload=True, progress_cb=None, item_cb=None):
+def analyze_many(payloads, auto_upload=True, progress_cb=None, item_cb=None,
+                 live_cb=None):
     """
     批量分析
     payloads: [(domain, url), ...]
@@ -121,9 +154,12 @@ def analyze_many(payloads, auto_upload=True, progress_cb=None, item_cb=None):
         if item_cb:
             item_cb(i, len(payloads), domain, url)
         r = analyze_payload(url, idx=i, auto_upload=auto_upload,
-                            progress_cb=progress_cb)
+                            progress_cb=progress_cb, live_cb=live_cb)
         r["domain"] = domain
         results.append(r)
+        if live_cb:
+            live_cb({"index": i, "stage": "完成", "stage_key": "item_done",
+                     "file": ""})
     return results
 
 
@@ -131,14 +167,20 @@ def collect_payloads(results, only_risky=True):
     """
     从探测结果里收集所有载荷链接
     返回 [(domain, url), ...] 去重
+
+    only_risky=True 时不再直接跳过低分域名——只要页面里出现可执行文件，
+    就值得送 VT 查一次（低分域名也可能是没被识别的仿冒站）。
+    风险等级只用于排序，高危优先。
     """
     seen = set()
     out = []
+    # 高危优先处理
+    if only_risky:
+        _lvl_rank = {"高危": 0, "可疑": 1, "低危": 2, "正常": 3}
+        results = sorted(
+            results,
+            key=lambda x: _lvl_rank.get((x.get("risk") or {}).get("level"), 9))
     for r in results:
-        if only_risky:
-            lvl = (r.get("risk") or {}).get("level")
-            if lvl not in ("高危", "可疑"):
-                continue
         h = r.get("http_best") or {}
         for u in (h.get("payload_strong") or []):
             if u not in seen:
@@ -157,3 +199,63 @@ def collect_payloads(results, only_risky=True):
                 seen.add(u)
                 out.append((r["domain"], u))
     return out
+
+
+def analyze_many_p(payloads, auto_upload=True, progress_cb=None, item_cb=None,
+                   live_cb=None, vt_progress_cb=None, workers=2):
+    """
+    并发版批量分析
+    item_cb(i, total, domain, url)       开始处理某个载荷
+    done_cb(domain, url, result)         每个载荷完成（通过 live_cb 的 item_done 事件）
+    vt_progress_cb(i, domain, url, info) VT 轮询进度
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    total = len(payloads)
+    results = []
+    idx_map = {}
+
+    def one(i, domain, url):
+        if item_cb:
+            item_cb(i, total, domain, url)
+
+        def _live(info):
+            if live_cb:
+                info = dict(info or {})
+                info["domain"] = domain
+                info["url"] = url
+                info["index"] = i
+                info["total"] = total
+                live_cb(info)
+
+        def _vprog(info):
+            if vt_progress_cb:
+                vt_progress_cb(i, domain, url, info)
+
+        r = analyze_payload(url, idx=i, auto_upload=auto_upload,
+                            progress_cb=progress_cb, live_cb=_live,
+                            vt_progress_cb=_vprog)
+        r["domain"] = domain
+        r["index"] = i
+        return r
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {}
+        for i, (domain, url) in enumerate(payloads, 1):
+            futs[ex.submit(one, i, domain, url)] = (i, domain, url)
+        for f in as_completed(futs):
+            i, domain, url = futs[f]
+            try:
+                r = f.result()
+            except Exception as e:
+                r = {"domain": domain, "url": url, "index": i,
+                     "error": "%s: %s" % (type(e).__name__, str(e)[:100]),
+                     "vt": {"found": False, "error": str(e)[:60]}}
+            results.append(r)
+            if live_cb:
+                live_cb({"index": i, "total": total, "stage": "完成",
+                         "stage_key": "item_done", "domain": domain,
+                         "url": url, "file": ""})
+
+    results.sort(key=lambda x: x.get("index", 0))
+    return results

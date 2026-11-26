@@ -44,7 +44,8 @@
     {
       "name": "网易UU",
       "official": [
-        "uuyc.163.com","uuyc.com"
+        "uuyc.163.com",
+        "uuyc.com"
       ],
       "aliases": [
         "uu",
@@ -151,10 +152,17 @@
     {
       "name": "ToDesk",
       "official": [
-        "todesk.com"
+        "todesk.com",
+        "www.todesk.com"
       ],
       "aliases": [
         "todesk"
+      ],
+      "keywords": [
+        "todesk",
+        "远程桌面",
+        "远程控制",
+        "远程办公"
       ]
     },
     {
@@ -282,29 +290,48 @@
     {
       "name": "向日葵",
       "official": [
-        "oray.com"
+        "oray.com",
+        "sunlogin.oray.com",
+        "sunlogin.com"
       ],
       "aliases": [
         "oray",
         "sunlogin"
+      ],
+      "keywords": [
+        "向日葵",
+        "向日葵远程",
+        "sunlogin",
+        "oray",
+        "远程协助"
       ]
     },
     {
       "name": "TeamViewer",
       "official": [
-        "teamviewer.com"
+        "teamviewer.com",
+        "www.teamviewer.com"
       ],
       "aliases": [
         "teamviewer"
+      ],
+      "keywords": [
+        "teamviewer",
+        "远程控制"
       ]
     },
     {
       "name": "AnyDesk",
       "official": [
-        "anydesk.com"
+        "anydesk.com",
+        "anydesk.cn"
       ],
       "aliases": [
         "anydesk"
+      ],
+      "keywords": [
+        "anydesk",
+        "远程桌面"
       ]
     },
     {
@@ -533,6 +560,49 @@
     "privacy@",
     "protect@",
     "redacted",
-    "withheldforprivacy"
+    "withheldforprivacy",
+    "domain-contact.org",
+    "whoisprotect",
+    "privacyguardian",
+    "contact-form",
+    "donutsprivacy",
+    "gdpr-masking"
+  ],
+  "privacy_placeholder_names": [
+    "redacted for privacy",
+    "redacted",
+    "not disclosed",
+    "n/a",
+    "-",
+    "privacy service provided",
+    "whois privacy",
+    "domain privacy",
+    "withheld for privacy",
+    "data protected",
+    "gdpr masked",
+    "statutory masking enabled",
+    "redacted by privacy service",
+    "privacy protection service",
+    "identity protected",
+    "contact privacy inc",
+    "domains by proxy",
+    "withheld",
+    "not available",
+    "no data",
+    "protected"
+  ],
+  "privacy_keywords": [
+    "隐私保护",
+    "whois privacy",
+    "privacy protect",
+    "隐私服务",
+    "redacted for privacy",
+    "gdpr",
+    "data protected",
+    "domain privacy",
+    "whoisproxy",
+    "whois proxy",
+    "withheld for privacy",
+    "privacy service"
   ]
 }

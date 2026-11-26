@@ -124,6 +124,13 @@ def whois(domain):
     o["whois_server"] = server
     o["raw"] = txt[:6000]
 
+    # 隐私保护判定
+    try:
+        o["privacy"] = detect_privacy(txt, o)
+    except Exception:
+        o["privacy"] = {"enabled": False, "matched": [], "evidence": [],
+                        "registrar_privacy": False}
+
     low = txt.lower()
     if ("no match for" in low or "no matching record" in low
             or "not found" in low or "no entries found" in low):
@@ -148,3 +155,117 @@ def format_summary(w):
     if w.get("reg_time"):
         bits.append("注册=" + str(w["reg_time"])[:10])
     return " | ".join(bits) or "已注册，信息未公开"
+
+# ---------------------------------------------------------------- 隐私保护识别
+_PRIVACY_NAME_PAT = [
+    r"redacted for privacy", r"^redacted$", r"not disclosed", r"^n/?a$",
+    r"^privacy", r"privacy service", r"whois privacy", r"domain privacy",
+    r"withheld for privacy", r"data protected", r"gdpr masked",
+    r"statutory masking", r"identity protected", r"contact privacy",
+    r"domains by proxy", r"withheld", r"protected$", r"^not available$",
+]
+
+
+def _is_private_value(v):
+    """判断单个字段值是否是隐私占位"""
+    if not v:
+        return False
+    s = str(v).strip().lower()
+    if s in ("", "-", "n/a", "na", "none", "null", "not available"):
+        return True
+    for pat in _PRIVACY_NAME_PAT:
+        if re.search(pat, s):
+            return True
+    return False
+
+
+def _is_private_email(v):
+    """邮箱侧：占位邮箱或含隐私关键词"""
+    if not v:
+        return False
+    s = str(v).strip().lower()
+    for k in ("privacy@", "protect@", "redacted", "withheld",
+              "domain-contact.org", "whoisprotect", "privacyguardian",
+              "contact-form", "donotsell", "gdpr"):
+        if k in s:
+            return True
+    if s.startswith("abuse@") and _is_private_value(s):
+        return True
+    return False
+
+
+def detect_privacy(txt, parsed=None):
+    """
+    综合判定 WHOIS 是否启用了隐私保护
+    返回 {
+      enabled: bool,
+      matched: [命中的字段名...],
+      evidence: [命中的原文片段...],
+      registrar_privacy: bool   # 注册商本身提供隐私服务（如 Domains By Proxy）
+    }
+    """
+    parsed = parsed or {}
+    low = (txt or "").lower()
+    matched = []
+    evidence = []
+
+    # 1) 结构化字段判定
+    field_map = {
+        "registrant": ("注册人", parsed.get("registrant")),
+        "email": ("注册邮箱", parsed.get("email")),
+        "phone": ("电话", parsed.get("phone")),
+        "country": ("国家", parsed.get("country")),
+        "org": ("组织", parsed.get("org")),
+    }
+    for key, (label, v) in field_map.items():
+        if key == "email":
+            if _is_private_email(v):
+                matched.append(label)
+                if v:
+                    evidence.append(v[:50])
+        else:
+            if _is_private_value(v):
+                matched.append(label)
+                if v:
+                    evidence.append(str(v)[:50])
+
+    # 2) 原文关键词判定
+    kw_hits = []
+    for kw in ("隐私保护", "whois privacy", "privacy protect", "隐私服务",
+               "redacted for privacy", "data protected", "domain privacy",
+               "withheld for privacy", "privacy service",
+               "whoisproxy", "whois proxy", "gdpr masked"):
+        if kw in low:
+            kw_hits.append(kw)
+
+    if kw_hits:
+        evidence.extend(kw_hits[:3])
+        # 关键词命中但字段没识别到时，至少标邮箱
+        if not matched:
+            matched.append("注册信息")
+
+    # 3) 注册商本身是隐私代理
+    reg = (parsed.get("registrar") or "").lower()
+    reg_privacy = any(k in reg for k in
+                      ("privacy", "proxy", "protect", "withheld",
+                       "domains by proxy", "identity"))
+
+    enabled = bool(matched or kw_hits or reg_privacy)
+    return {
+        "enabled": enabled,
+        "matched": sorted(set(matched)),
+        "evidence": list(dict.fromkeys(evidence))[:5],
+        "registrar_privacy": reg_privacy,
+    }
+
+
+def privacy_text(pinfo):
+    """生成给人看的隐私保护说明"""
+    if not pinfo or not pinfo.get("enabled"):
+        return None
+    m = pinfo.get("matched") or []
+    if m:
+        return ("该域名已采取 WHOIS 隐私保护服务（隐藏字段：%s）"
+                % "、".join(m))
+    return "该域名已采取 WHOIS 隐私保护服务"
+

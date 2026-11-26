@@ -46,7 +46,8 @@ STAGES = [
     ("cert", "TLS证书"),
     ("ip", "IP情报"),
     ("mn", "多节点"),
-    ("score", "风险评分"),
+("score", "风险评分"),
+    ("payload", "载荷分析"),
 ]
 STAGE_NAME = dict(STAGES)
 STAGE_ORDER = {k: i for i, (k, _) in enumerate(STAGES)}
@@ -55,6 +56,33 @@ C_DONE = "#7FD17F"   # 完成：明显绿
 C_RUN = "#FFC000"    # 进行中：明显橙黄
 
 NONE = "None"   # 跑了但无数据时的占位
+
+
+def _privacy_line(w):
+    """
+    WHOIS 隐私保护显示文本
+    w: whois 字典
+    """
+    if not w:
+        return None
+    pinfo = w.get("privacy")
+    if not pinfo:
+        # 老数据没跑过检测：现场判断一次
+        try:
+            from core import whoisx
+            pinfo = whoisx.detect_privacy(w.get("raw") or "", w)
+        except Exception:
+            pinfo = None
+    if not pinfo:
+        return None
+    if not pinfo.get("enabled"):
+        return "未启用"
+    m = pinfo.get("matched") or []
+    if pinfo.get("registrar_privacy") and not m:
+        return "该域名已采取 WHOIS 隐私保护服务（注册商本身为隐私代理）"
+    if m:
+        return "该域名已采取 WHOIS 隐私保护服务（隐藏：%s）" % "、".join(m)
+    return "该域名已采取 WHOIS 隐私保护服务"
 
 
 def parse_domains(text):
@@ -88,6 +116,87 @@ def _join(v, sep=", "):
     return str(v)
 
 
+def _fmt_secs(v):
+    try:
+        v = int(v)
+    except Exception:
+        return "-"
+    if v < 60:
+        return "%ds" % v
+    return "%dm%02ds" % (v // 60, v % 60)
+
+
+def _payload_slot_v2(i, pa, r, vt_done, done_stages):
+    """
+    返回第 i 个载荷槽位的 (文件, VT结果, 威胁类型, SHA256, 状态, 本地)
+    优先用 pa（已完成结果），其次用 payload_progress（进行中）
+    """
+    prog = r.get("payload_progress") or {}
+
+    if i < len(pa):
+        x = pa[i]
+        v = x.get("vt") or {}
+        st = v.get("stats") or {}
+        mal = st.get("malicious", 0)
+        tot = st.get("total", 0)
+
+        size = x.get("size") or 0
+        fname = (x.get("filename") or "-")[:30]
+        fkind = x.get("kind") or "-"
+        ftxt = "%s（%s，%s）" % (
+            fname, fkind,
+            ("%.1f MB" % (size / 1048576)) if size else "-")
+
+        if v.get("found"):
+            if tot:
+                vt_txt = ("%d/%d 引擎报毒" % (mal, tot)) if mal > 0 \
+                    else ("0/%d 无引擎报毒" % tot)
+            else:
+                vt_txt = "库中已有记录"
+        elif v.get("upload_failed"):
+            vt_txt = "上传失败：%s" % ((v.get("error") or "-")[:40])
+        elif v.get("error"):
+            vt_txt = "查询失败：%s" % (v["error"][:40])
+        else:
+            vt_txt = "无记录"
+
+        return (ftxt, vt_txt,
+                v.get("label") or None,
+                (x.get("sha256") or None),
+                "已上传" if x.get("uploaded") else "库中已有",
+                "已删除" if x.get("deleted") else
+                ("待删除" if x.get("path") else None))
+
+    # 进行中：payload_progress 里按顺序找第一个未完成项
+    pg = None
+    if prog:
+        vals = [v for v in prog.values() if isinstance(v, dict)]
+        # 已经出结果的 url 集合
+        done_urls = {(x.get("url") or "") for x in pa}
+        pend = [v for v in vals if (v.get("url") or "") not in done_urls]
+        if i < len(pend):
+            pg = pend[i]
+        elif i == len(pa) and pend:
+            pg = pend[0]
+    if pg:
+        stage_key = pg.get("stage_key") or ""
+        stage_txt = pg.get("stage") or "处理中"
+        pct = pg.get("pct")
+        if stage_key == "vt_wait" and pct is not None:
+            vt_txt = "%s（%d%%）" % (stage_txt, pct)
+        elif stage_key == "item_done":
+            vt_txt = "完成"
+        else:
+            vt_txt = stage_txt
+        fname = (pg.get("file") or "").rsplit("/", 1)[-1][:30] or None
+        return (fname, vt_txt, None, None, "分析中", None)
+
+    # 没数据
+    if vt_done or pa or prog:
+        return (None, None, None, None, None, None)
+    return ("", "", "", "", "", "")
+
+
 def build_sections(r, done_stages):
     """
     done_stages: 已完成的阶段集合
@@ -108,8 +217,9 @@ def build_sections(r, done_stages):
     mn = r.get("multi_node") or {}
     ip0 = (r.get("ip_infos") or [{}])[0]
 
-    def val(stage, v):
-        if stage not in done_stages:
+    def val(stage, v, force=False):
+        # force=True：即使阶段未完成也显示（用于 VT 进行中等实时状态）
+        if not force and stage not in done_stages:
             return ""
         if v is None or v == "" or v == [] or v == {}:
             return NONE
@@ -154,6 +264,7 @@ def build_sections(r, done_stages):
         ("NS 记录", val("whois", _join(w.get("ns")))),
         ("DNSSEC", val("whois", w.get("dnssec"))),
         ("Abuse 邮箱", val("whois", w.get("abuse_email"))),
+        ("隐私保护", val("whois", _privacy_line(w))),
     ]
     S.append(("注册信息", rows))
 
@@ -263,48 +374,56 @@ def build_sections(r, done_stages):
 
     S.append(("载荷设施", rows))
 
-    # ---- 载荷分析（VT）——独立分区，字段固定，避免动态标签导致控件错位 ----
+    # ---- 载荷分析（VT）----
     pa = r.get("payload_analysis") or []
-    prow = []
+    prog = r.get("payload_progress") or {}
+    live = r.get("payload_live") or {}
+    vt_done = "payload" in done_stages
+    # 有任何线索就显示（不再依赖 done_stages）
+    show = bool(pa or prog or live or vt_done)
+
+    # 进度条行
+    bar_rows = []
     for i in range(4):
         if i < len(pa):
-            x = pa[i]
-            v = x.get("vt") or {}
-            st = v.get("stats") or {}
-            mal = st.get("malicious", 0)
-            tot = st.get("total", 0)
-
-            prow.append(("载荷 %d 文件" % (i + 1),
-                         val("score", "%s（%s，%s）"
-                             % ((x.get("filename") or "-")[:30],
-                                x.get("kind") or "-",
-                                ("%.1f MB" % (x.get("size", 0) / 1048576))
-                                if x.get("size") else "-"))))
-            if v.get("found"):
-                vt_txt = "%d/%d 引擎报毒" % (mal, tot)
-                if mal == 0:
-                    vt_txt = "0/%d 无引擎报毒" % tot
-                prow.append(("载荷 %d VT结果" % (i + 1), val("score", vt_txt)))
-            elif v.get("upload_failed"):
-                prow.append(("载荷 %d VT结果" % (i + 1),
-                             val("score", "上传失败：%s" % (v.get("error") or "")[:30])))
-            elif v.get("error"):
-                prow.append(("载荷 %d VT结果" % (i + 1),
-                             val("score", "查询失败：%s" % v["error"][:30])))
-            else:
-                prow.append(("载荷 %d VT结果" % (i + 1), val("score", "无记录")))
-
-            prow.append(("载荷 %d 威胁类型" % (i + 1),
-                         val("score", v.get("label") or None)))
-            prow.append(("载荷 %d SHA256" % (i + 1),
-                         val("score", (x.get("sha256") or "-")[:64])))
-            prow.append(("载荷 %d 状态" % (i + 1),
-                         val("score", "已上传" if x.get("uploaded") else "库中已有")))
-            prow.append(("载荷 %d 本地" % (i + 1),
-                         val("score", "已删除" if x.get("deleted") else "未删除")))
+            v = pa[i].get("vt") or {}
+            cap = ("已完成 %d/%d 报毒" % ((v.get("stats") or {}).get("malicious", 0),
+                                       (v.get("stats") or {}).get("total", 0))
+                   if v.get("found") else
+                   ("失败：%s" % (v.get("error") or "")[:24] if v.get("error")
+                    else "已完成"))
+            bar_rows.append(("载荷 %d 进度" % (i + 1), ("__bar__", 100, cap)))
+            continue
+        pg = prog.get(i + 1) or prog.get(str(i + 1))
+        if not pg and live and (live.get("index") or 0) == i + 1:
+            pg = {"stage": live.get("stage"), "pct": live.get("pct"),
+                  "stage_key": live.get("stage_key")}
+        if pg:
+            pct = pg.get("pct")
+            if pct is None:
+                pct = {"download": 15, "hash": 30, "vt_query": 45,
+                       "vt_upload": 60, "vt_wait": 75,
+                       "delete": 95}.get(pg.get("stage_key") or "", 10)
+            cap = pg.get("stage") or "处理中"
+            bar_rows.append(("载荷 %d 进度" % (i + 1),
+                             ("__bar__", float(pct), str(cap)[:40])))
         else:
-            for f in ("文件", "VT结果", "威胁类型", "SHA256", "状态", "本地"):
-                prow.append(("载荷 %d %s" % (i + 1, f), ""))
+            bar_rows.append(("载荷 %d 进度" % (i + 1),
+                             ("__bar__", 0, "等待中" if show else "-")))
+    S.append(("载荷分析进度", bar_rows))
+
+    # 数据行
+    prow = []
+    _labels = ("文件", "VT结果", "威胁类型", "SHA256", "状态", "本地")
+    for i in range(4):
+        slot = _payload_slot_v2(i, pa, r, vt_done, done_stages)
+        for f, v in zip(_labels, slot):
+            if show:
+                prow.append(("载荷 %d %s" % (i + 1, f), val("payload", v, force=True)))
+            else:
+                # 还没开始分析：第一格给个提示，其余留空
+                prow.append(("载荷 %d %s" % (i + 1, f),
+                             "待分析（勾选 VT分析 或点「分析载荷」）" if f == "文件" else ""))
     S.append(("载荷分析", prow))
 
     # ---- 多节点 ----
@@ -322,9 +441,30 @@ def build_sections(r, done_stages):
     S.append(("多节点", rows))
 
     # ---- 风险依据 ----
-    reasons = risk.get("reasons") or []
+    # score_v2 返回 strong/weak/deduct 三个带权重的列表；兼容旧的 reasons 字段
+    reasons = []
+    if risk.get("reasons"):
+        reasons = list(risk["reasons"])
+    else:
+        for label, key, sign in (("强证据", "strong", "+"),
+                                 ("弱证据", "weak", "+"),
+                                 ("减分", "deduct", "")):
+            for item in (risk.get(key) or []):
+                # 正常是 (文本, 权重) 元组，也兼容纯字符串
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    txt, wgt = item[0], item[1]
+                else:
+                    txt, wgt = str(item), ""
+                if sign:
+                    reasons.append("[%s +%s] %s"
+                                   % (label, wgt, txt) if wgt
+                                   else "[%s] %s" % (label, txt))
+                else:
+                    reasons.append("[%s %s] %s"
+                                   % (label, wgt, txt) if wgt
+                                   else "[%s] %s" % (label, txt))
     rows = []
-    for i in range(6):
+    for i in range(8):
         rows.append(("依据 %d" % (i + 1),
                      val("score", reasons[i] if i < len(reasons) else None)))
     S.append(("风险依据", rows))
@@ -350,6 +490,14 @@ class App(tk.Tk):
         self.live_state = {}      # domain -> {snapshot, done_stages, status}          # 正在探测的临时结果
 
         self._value_labels = {}
+        # 实时 VT 队列
+        import threading as _th
+        self._vt_lock = _th.Lock()
+        self._vt_queue = []
+        self._vt_seen = set()
+        self._vt_idx = 0
+        self._vt_worker_started = False
+        self._payload_progress = {}
         self._build()
         self._render_placeholder()
         self.after(100, self._poll)
@@ -544,6 +692,22 @@ class App(tk.Tk):
                               width=LABEL_W, font=("", 9))
                 lb.grid(row=r, column=base_col, sticky="w", padx=(4, 2), pady=1)
 
+                # 进度条格子：值为 ("__bar__", 百分比, 说明文字)
+                if isinstance(value, tuple) and len(value) >= 3 and value[0] == "__bar__":
+                    holder = tk.Frame(self.grid_frame, bg="white",
+                                      relief="solid", bd=1)
+                    pb = ttk.Progressbar(holder, mode="determinate",
+                                         maximum=100, length=150)
+                    pb.pack(side="left", padx=(3, 4), pady=2)
+                    cap = tk.Label(holder, text=str(value[2]), anchor="w",
+                                   bg="white", font=("", 8))
+                    cap.pack(side="left", fill="x", expand=True)
+                    holder.grid(row=r, column=base_col + 1, sticky="ew",
+                                padx=(0, 10), pady=1, ipady=2)
+                    pb["value"] = float(value[1] or 0)
+                    self._value_labels[(title, label)] = ("bar", pb, cap)
+                    continue
+
                 v = "" if value is None else str(value)
                 ent = tk.Entry(self.grid_frame, relief="solid", bd=1,
                                font=("", 9), bg="white",
@@ -571,6 +735,18 @@ class App(tk.Tk):
             for label, value in rows:
                 ent = self._value_labels.get((title, label))
                 if ent is None:
+                    continue
+                # 进度条
+                if isinstance(ent, tuple) and ent[0] == "bar":
+                    if isinstance(value, tuple) and len(value) >= 3 \
+                            and value[0] == "__bar__":
+                        try:
+                            ent[1]["value"] = float(value[1] or 0)
+                        except Exception:
+                            pass
+                        txt = str(value[2])
+                        if ent[2].cget("text") != txt:
+                            ent[2].config(text=txt)
                     continue
                 v = "" if value is None else str(value)
                 if ent.get() == v:
@@ -634,14 +810,23 @@ class App(tk.Tk):
             st["status"] = "run"
 
     def _on_domain_done(self, r):
-        """单个域名跑完：写入 live_state，状态标完成"""
+        """单个域名跑完：写入 live_state，状态标完成（保留已有载荷分析结果）"""
         d = r.get("domain")
         st = self.live_state.setdefault(
             d, {"snapshot": {}, "done_stages": set(), "status": "run"})
         merged = dict(st.get("snapshot") or {})
         merged.update(r)
         merged["domain"] = d
+        # 探测结果里通常没有载荷字段，若快照/主记录已有则保留
+        src_rec = self.by_domain.get(d) or {}
+        for k in ("payload_analysis", "payload_progress", "payload_live"):
+            cur = merged.get(k)
+            if not cur:
+                v = st.get("snapshot", {}).get(k) or src_rec.get(k)
+                if v:
+                    merged[k] = v
         st["snapshot"] = merged
+        # 只有载荷分析也完成才置为全部阶段
         st["done_stages"] = {k for k, _ in STAGES}
         st["status"] = "done"
 
@@ -652,11 +837,28 @@ class App(tk.Tk):
             return
         st = self.live_state.get(d)
         if not st:
-            return
+            # 兜底：直接用 by_domain 渲染
+            rec = self.by_domain.get(d)
+            if not rec:
+                return
+            self.live_state[d] = {"snapshot": dict(rec),
+                                  "done_stages": {k for k, _ in STAGES},
+                                  "status": "done"}
+            st = self.live_state[d]
 
         snap = dict(st.get("snapshot") or {})
         snap.setdefault("domain", d)
+        # 用 by_domain 里的最新结果覆盖快照，保证载荷分析等后续结果能显示
+        latest = self.by_domain.get(d)
+        if latest:
+            for _k in ("payload_analysis", "payload_progress", "payload_live",
+                       "risk", "http_best", "cert", "multi_node", "abuse"):
+                if latest.get(_k) is not None:
+                    snap[_k] = latest[_k]
         done = set(st.get("done_stages") or set())
+        # payload 阶段只有分析过才算完成，避免永远置灰
+        if not (snap.get("payload_analysis") or snap.get("payload_progress")):
+            done.discard("payload")
 
         sections = build_sections(snap, done)
         self._update_values(sections)
@@ -780,6 +982,12 @@ class App(tk.Tk):
         self.live_state = {}
         self.stop_flag = False
         self.working = True
+        # 重置 VT 队列状态（每次新探测都清空）
+        with self._vt_lock:
+            self._vt_queue.clear()
+            self._vt_seen.clear()
+        self._vt_idx = 0
+        self._vt_worker_started = False
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.cmb["values"] = []
@@ -828,10 +1036,22 @@ class App(tk.Tk):
         def stage_cb(domain, key, snapshot=None):
             self.msg_q.put(("stage", domain, key, snapshot))
 
+        do_vt = bool(options.get("vt_analysis"))
+
         def one(d):
             if self.stop_flag:
                 return None
-            return probe_with_stage(d, options, stage_cb)
+            r = probe_with_stage(d, options, stage_cb)
+            # 探测完立刻把载荷交出去分析，不等全部结束
+            if do_vt and r and not self.stop_flag:
+                try:
+                    pl = payload_mod.collect_payloads([r], only_risky=True)
+                    if pl:
+                        self._enqueue_vt(pl)
+                        r["_vt_pending"] = True
+                except Exception:
+                    pass
+            return r
 
         try:
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -845,30 +1065,16 @@ class App(tk.Tk):
                     try:
                         r = f.result()
                     except Exception as e:
-                        r = {"domain": futs[f], "error": str(e)[:150],
-                             "risk": {"score": 0, "level": "探测失败",
-                                      "reasons": [str(e)[:100]]}}
-                    done += 1
+                        r = None
+                        self.msg_q.put(("stage_err", futs[f], str(e)[:120]))
                     if r:
                         results.append(r)
+                        done += 1
                         self.msg_q.put(("row", r, done, len(domains)))
-
-            order = {d: i for i, d in enumerate(domains)}
-            results.sort(key=lambda x: order.get(x["domain"], 9999))
-            from collections import Counter
-            lv = Counter(r.get("risk", {}).get("level", "未知") for r in results)
-            stats = {
-                "total": len(results), "by_level": dict(lv),
-                "alive": sum(1 for r in results if (r.get("dns") or {}).get("A")),
-                "dynamic": sum(1 for r in results
-                               if (r.get("dns_multi") or {}).get("dynamic")),
-                "with_payload": sum(1 for r in results
-                                    if (r.get("http_best") or {}).get("download_links")),
-                "elapsed": round(sum(r.get("elapsed", 0) for r in results), 1),
-            }
-            self.msg_q.put(("done", results, stats))
+            self.msg_q.put(("done", results, self.stats))
         except Exception:
-            self.msg_q.put(("error", traceback.format_exc()[:900]))
+            import traceback
+            self.msg_q.put(("error", traceback.format_exc()[:800]))
 
     def _stop(self):
         self.stop_flag = True
@@ -900,12 +1106,37 @@ class App(tk.Tk):
                 elif k == "payload_item":
                     _, i, total, domain, url = m
                     self.status.config(text="分析载荷 %d/%d  %s" % (i, total, domain))
+                elif k == "payload_live":
+                    self._apply_payload_live(m[1])
+                elif k == "payload_vt_progress":
+                    _, idx, domain, url, pct, text, stats = m
+                    if domain in self.by_domain:
+                        pr = self.by_domain[domain].setdefault(
+                            "payload_progress", {})
+                        cur = pr.get(url) or {}
+                        cur.update({"stage": text, "pct": pct,
+                                    "url": url, "file": cur.get("file") or "",
+                                    "stage_key": "vt_wait",
+                                    "stats": stats})
+                        pr[url] = cur
+                        st0 = self.live_state.get(domain)
+                        if st0 is not None:
+                            st0.setdefault("snapshot", {})[
+                                "payload_progress"] = pr
+                    if domain == self._cur_domain():
+                        self._refresh_view()
+                elif k == "payload_result":
+                    self._apply_payload_result(m[1])
+                elif k == "payload_all_done":
+                    self.status.config(text="载荷分析全部完成")
                 elif k == "payload_stage":
                     _, stage, url = m
-                    label = {"download": "下载中", "vt_query": "查VT",
-                             "vt_upload": "上传VT", "vt_wait": "等结果",
-                             "delete": "删除中"}.get(stage, stage)
+                    label = {"download": "下载中", "hash": "计算哈希",
+                             "vt_query": "查VT", "vt_upload": "上传VT",
+                             "vt_wait": "等结果", "delete": "删除中"}.get(stage, stage)
                     self.status.config(text="%s → %s" % (label, url[:70]))
+                    if stage in ("delete", "vt_wait"):
+                        pass
                 elif k == "payload_done":
                     rescore = m[2] if len(m) > 2 else False
                     self._on_payload_done(m[1], rescore)
@@ -950,15 +1181,30 @@ class App(tk.Tk):
         self.tree.yview_moveto(1.0)
         self._on_domain_done(r)
 
-        # 实时刷新正在显示的域名
-        d = self._cur_domain()
-        if d == r["domain"]:
-            self.done_stages = {k for k, _ in STAGES}
-            self._update_values(build_sections(r, self.done_stages))
+        # 实时刷新正在显示的域名（走 _refresh_view，按域名各自状态渲染）
+        if self._cur_domain() == r["domain"]:
+            self._refresh_view()
 
     def _on_done(self, results, stats):
         self.working = False
-        self.results = sorted(results,
+        # 关键：不要直接用 results 覆盖，把已有载荷分析结果合并回来
+        old = dict(self.by_domain)
+        merged = []
+        for r in results:
+            d = r.get("domain")
+            prev = old.get(d) or {}
+            # 保留已算出的载荷结果、进度、评分
+            for k in ("payload_analysis", "payload_progress",
+                      "payload_live", "abuse"):
+                if prev.get(k):
+                    r[k] = prev[k]
+            # 若载荷分析已带来更高分，保留那个评分
+            pr = prev.get("risk") or {}
+            cr = r.get("risk") or {}
+            if pr.get("score", 0) > cr.get("score", 0):
+                r["risk"] = pr
+            merged.append(r)
+        self.results = sorted(merged,
                               key=lambda y: -(y.get("risk") or {}).get("score", 0))
         self.by_domain = {r["domain"]: r for r in self.results}
         self.stats = stats
@@ -1083,7 +1329,8 @@ class App(tk.Tk):
             try:
                 res = payload_mod.analyze_many(payloads, auto_upload=True,
                                                progress_cb=prog_cb,
-                                               item_cb=item_cb)
+                                               item_cb=item_cb,
+                                               live_cb=self._set_payload_live)
                 self.msg_q.put(("payload_done", res, True))
             except Exception:
                 import traceback
@@ -1091,6 +1338,115 @@ class App(tk.Tk):
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
+
+    # ================= 实时 VT 队列（探测完一个就分析一个）=================
+    def _enqueue_vt(self, payloads):
+        """把载荷放进队列，后台消费线程并发处理"""
+        with self._vt_lock:
+            for p in payloads:
+                if p[1] not in self._vt_seen:
+                    self._vt_seen.add(p[1])
+                    self._vt_queue.append(p)
+        if not getattr(self, "_vt_worker_started", False):
+            self._vt_worker_started = True
+            import threading
+            threading.Thread(target=self._vt_consumer, daemon=True).start()
+
+    def _vt_consumer(self):
+        """并发消费 VT 队列（轮询式，不会死等）"""
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import time as _t
+
+        def one(item):
+            idx, (domain, url) = item
+
+            def _live(info):
+                info = dict(info or {})
+                info["domain"] = domain
+                info["url"] = url
+                info["index"] = idx
+                self.msg_q.put(("payload_live", info))
+
+            def _vprog(elapsed, total, pct, text, stats):
+                self.msg_q.put(("payload_vt_progress",
+                                idx, domain, url, pct, text, stats))
+
+            try:
+                r = payload_mod.analyze_payload(
+                    url, idx=idx, auto_upload=True,
+                    live_cb=_live,
+                    vt_progress_cb=lambda i: _vprog(
+                        i.get("elapsed", 0), i.get("total", 0),
+                        i.get("pct", 0), i.get("text", ""), i.get("stats")))
+            except Exception as e:
+                r = {"domain": domain, "url": url,
+                     "error": "%s: %s" % (type(e).__name__, str(e)[:100]),
+                     "vt": {"found": False, "error": str(e)[:60]}}
+            r["domain"] = domain
+            r["index"] = idx
+            return r
+
+        idle_rounds = 0
+        ex = ThreadPoolExecutor(max_workers=3)
+        try:
+            running = {}
+            while True:
+                if self.stop_flag:
+                    break
+
+                # 提交新任务
+                with self._vt_lock:
+                    while self._vt_queue and len(running) < 3:
+                        domain, url = self._vt_queue.pop(0)
+                        self._vt_idx += 1
+                        idx = self._vt_idx
+                        fut = ex.submit(one, (idx, (domain, url)))
+                        running[fut] = (idx, domain, url)
+
+                # 队列空且没有在跑 → 计数空闲轮次，连续 8 轮（约 4 秒）就退出
+                if not running and not self._vt_queue:
+                    with self._vt_lock:
+                        empty = not self._vt_queue
+                    if empty:
+                        idle_rounds += 1
+                        if idle_rounds >= 8:
+                            break
+                        _t.sleep(0.5)
+                        continue
+                    idle_rounds = 0
+
+                idle_rounds = 0
+                if not running:
+                    _t.sleep(0.2)
+                    continue
+
+                # 等任意一个完成（最多 1 秒）
+                try:
+                    done_set, _ = wait(list(running.keys()),
+                                       timeout=1.0,
+                                       return_when=FIRST_COMPLETED)
+                except Exception:
+                    done_set = set()
+
+                for f in done_set:
+                    item = running.pop(f, None)
+                    if not item:
+                        continue
+                    i, domain, url = item
+                    try:
+                        r = f.result()
+                    except Exception as e:
+                        r = {"domain": domain, "url": url,
+                             "error": str(e)[:100],
+                             "vt": {"found": False, "error": str(e)[:60]}}
+                    self.msg_q.put(("payload_result", r))
+        finally:
+            try:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
+
+        self.msg_q.put(("payload_all_done", None))
 
     def _analyze_payloads(self):
         """下载载荷 → 计算哈希 → 查 VT → 上传（如无记录）→ 删除"""
@@ -1141,7 +1497,7 @@ class App(tk.Tk):
                 res = payload_mod.analyze_many(payloads, auto_upload=True,
                                                progress_cb=prog_cb,
                                                item_cb=item_cb)
-                self.msg_q.put(("payload_done", res))
+                self.msg_q.put(("payload_done", res, True))
             except Exception:
                 import traceback
                 self.msg_q.put(("payload_error", traceback.format_exc()[:600]))
@@ -1149,17 +1505,127 @@ class App(tk.Tk):
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
+    # ================= 载荷进度面板 =================
+    def _set_payload_live(self, info):
+        """VT 过程中实时更新载荷区状态（在 worker 线程调用，走队列）"""
+        self.msg_q.put(("payload_live", info))
+
+    def _apply_payload_live(self, info):
+        """主线程应用实时状态"""
+        self._payload_live = dict(info or {})
+        d = info.get("domain")
+        if d and d in self.by_domain:
+            # 手动分析时可能没跑过探测，这里补建 live_state
+            if d not in self.live_state:
+                self.live_state[d] = {
+                    "snapshot": dict(self.by_domain[d]),
+                    "done_stages": {k for k, _ in STAGES},
+                    "status": "done"}
+            self.by_domain[d]["payload_live"] = self._payload_live
+            # 用 URL 作 key，避免全局 idx 在切换域名后错位
+            u = info.get("url") or ("#%s" % info.get("index"))
+            pr = self.by_domain[d].setdefault("payload_progress", {})
+            cur = pr.get(u) or {}
+            cur.update({"stage": info.get("stage") or "",
+                        "stage_key": info.get("stage_key") or "",
+                        "file": info.get("file") or "",
+                        "url": info.get("url") or "",
+                        "pct": info.get("pct")})
+            pr[u] = cur
+            st = self.live_state.get(d)
+            if st:
+                snap = st.setdefault("snapshot", {})
+                snap["payload_live"] = self._payload_live
+                snap["payload_progress"] = self.by_domain[d].get(
+                    "payload_progress") or {}
+        # 只有当前正在显示的域名才刷新，避免乱跳
+        if d and d == self._cur_domain():
+            self._refresh_view()
+
+    def _apply_payload_result(self, r):
+        """单个载荷分析完成：挂到对应域名 + 重算评分 + 刷新"""
+        d = r.get("domain")
+        if not d or d not in self.by_domain:
+            return
+        rec = self.by_domain[d]
+        if d not in self.live_state:
+            self.live_state[d] = {"snapshot": dict(rec),
+                                  "done_stages": {k for k, _ in STAGES},
+                                  "status": "done"}
+        lst = rec.setdefault("payload_analysis", [])
+        # 去重：同 URL 覆盖
+        url = r.get("url")
+        lst = [x for x in lst if x.get("url") != url]
+        lst.append(r)
+        rec["payload_analysis"] = lst
+        # 清掉它的进行中进度
+        pr = rec.get("payload_progress") or {}
+        for k in (r.get("url"), r.get("index"), str(r.get("index"))):
+            if k is not None:
+                pr.pop(k, None)
+        rec["payload_progress"] = pr
+
+        # 重新评分
+        try:
+            from core import scoring
+            rec["risk"] = scoring.score_v2(rec)
+        except Exception:
+            pass
+
+        # 更新列表行的评分
+        try:
+            risk = rec.get("risk") or {}
+            self.tree.item(d, values=(
+                self.tree.item(d, "values")[0], d,
+                risk.get("score", 0), risk.get("level", ""),
+                self.tree.item(d, "values")[4],
+                self.tree.item(d, "values")[5],
+                self.tree.item(d, "values")[6]))
+        except Exception:
+            pass
+
+        # 同步到 live_state 快照，保证刷新能看到
+        st = self.live_state.get(d)
+        if st:
+            snap = st.setdefault("snapshot", {})
+            snap["payload_analysis"] = lst
+            snap["payload_progress"] = pr
+            snap["risk"] = rec.get("risk")
+
+        if d == self._cur_domain():
+            self._refresh_view()
+
+        vt = r.get("vt") or {}
+        stt = vt.get("stats") or {}
+        if vt.get("found"):
+            self.status.config(
+                text="VT 完成 %s：%d/%d 报毒" % (
+                    d, stt.get("malicious", 0), stt.get("total", 0)))
+        elif r.get("error"):
+            self.status.config(text="VT 失败 %s：%s" % (d, r["error"][:40]))
+
     def _on_payload_done(self, results, rescore=False):
         self._payload_results = results
+        self._payload_live = None
+        for d in list(self.by_domain):
+            self.by_domain[d].pop("payload_live", None)
         self.btn_start.config(state="normal")
 
-        # 把载荷结果挂到域名，重新评分
+        # 把载荷结果挂到域名，重新评分（先清空再写入，避免重复）
+        from core import scoring
+        touched = set()
+        for x in results:
+            d = x.get("domain")
+            if d and d in self.by_domain:
+                touched.add(d)
+        for d in touched:
+            self.by_domain[d]["payload_analysis"] = []
+        for x in results:
+            d = x.get("domain")
+            if d and d in self.by_domain:
+                self.by_domain[d].setdefault("payload_analysis", []).append(x)
+
         if rescore:
-            from core import scoring
-            for x in results:
-                d = x.get("domain")
-                if d and d in self.by_domain:
-                    self.by_domain[d].setdefault("payload_analysis", []).append(x)
             for r in self.results:
                 if r.get("payload_analysis"):
                     r["risk"] = scoring.score_v2(r)
@@ -1189,11 +1655,7 @@ class App(tk.Tk):
         self._update_quota()
         messagebox.showinfo("载荷分析完成", msg)
 
-        # 把结果挂到对应域名，并刷新视图
-        for x in results:
-            d = x.get("domain")
-            if d and d in self.by_domain:
-                self.by_domain[d].setdefault("payload_analysis", []).append(x)
+        # 刷新视图（结果已在上面挂好）
         self._refresh_view()
 
     def _gen_abuse(self):
